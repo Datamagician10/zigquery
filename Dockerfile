@@ -20,9 +20,14 @@
 # (see release.yml):
 #   dist/bin/{bigquery-emulator,zigquery}
 #   dist/{LICENSE,NOTICE,THIRD_PARTY_NOTICES}
-FROM gcr.io/distroless/cc-debian13:nonroot
+FROM gcr.io/distroless/cc-debian13:nonroot AS base
+
+FROM base
 
 COPY dist/bin/ /usr/local/bin/
+# /data owned by nonroot, so a fresh named volume mounted there for --database is writable.
+# Distroless has no shell, so the base's empty home directory is copied with --chown.
+COPY --from=base --chown=nonroot:nonroot /home/nonroot /data
 # The binaries statically link the libraries THIRD_PARTY_NOTICES lists, and
 # their licenses require the notices to ship with them.
 COPY dist/LICENSE dist/NOTICE dist/THIRD_PARTY_NOTICES /usr/share/doc/zigquery/

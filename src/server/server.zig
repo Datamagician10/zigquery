@@ -21,6 +21,8 @@ const std = @import("std");
 const zigquery = @import("zigquery");
 const job_rows_vtab = zigquery.function.job_rows_vtab;
 const driver = zigquery.driver;
+const OpenFailure = zigquery.sqlite.OpenFailure;
+const sqlite_c = zigquery.sqlite.c;
 
 const http_server = @import("http/server.zig");
 const router = @import("router.zig");
@@ -51,6 +53,49 @@ fn nowSeed() u64 {
     var tv: std.c.timeval = undefined;
     _ = std.c.gettimeofday(&tv, null);
     return @bitCast(@as(i64, @intCast(tv.sec)) *% 1_000_000 +% @as(i64, @intCast(tv.usec)));
+}
+
+/// One line saying why `--database` could not be opened. `euid` is named when the OS refused
+/// access, since a container's user is the usual cause.
+const OpenFailureReport = struct {
+    path: []const u8,
+    err: driver.Error,
+    failure: *const OpenFailure,
+    euid: std.c.uid_t,
+
+    pub fn format(r: OpenFailureReport, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("cannot open --database={s}: ", .{r.path});
+        if (r.err == error.IncompatibleStorageFormat) {
+            return w.writeAll("written in a storage format this build does not read; " ++
+                "point --database at a new file");
+        }
+        if (r.err == error.GoccyEmulatorDatabase) {
+            return w.writeAll("written by goccy/bigquery-emulator, whose storage this build " ++
+                "does not read; point --database at a new file");
+        }
+        if (r.failure.code == sqlite_c.SQLITE_OK) return w.print("{t}", .{r.err});
+        try w.writeAll(r.failure.message());
+        if (r.failure.errnoName()) |name| try w.print(" (errno {s})", .{name});
+        const denied = r.failure.errno == .ACCES or r.failure.errno == .PERM or
+            r.failure.primaryCode() == sqlite_c.SQLITE_READONLY;
+        if (denied) {
+            try w.print("; uid {d} needs write access to the file and its directory", .{r.euid});
+        }
+    }
+};
+
+/// Reports the directory's EACCES, EPERM or EROFS for a missing file. SQLite retries a refused
+/// read-write open read-only, and the retry fails with NOENT.
+fn blameUnwritableDirectory(io: std.Io, path: []const u8, failure: *OpenFailure) void {
+    if (failure.errno != .NOENT) return;
+    const dir = std.fs.path.dirname(path) orelse ".";
+    std.Io.Dir.cwd().access(io, dir, .{ .write = true }) catch |err| switch (err) {
+        error.AccessDenied => failure.errno = .ACCES,
+        error.PermissionDenied => failure.errno = .PERM,
+        error.ReadOnlyFileSystem => failure.errno = .ROFS,
+        // NOENT stands when the directory is missing too or cannot be inspected.
+        else => {},
+    };
 }
 
 /// Wall clock in milliseconds, for the deadlines an upload session carries.
@@ -102,6 +147,7 @@ pub const Server = struct {
     /// Host:port, for the selfLink-style URLs handlers build.
     endpoint: []const u8,
 
+    /// error.DatabaseOpenFailed means `opts.database` could not be opened, and the log says why.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Server {
         const s = try gpa.create(Server);
         errdefer gpa.destroy(s);
@@ -128,10 +174,21 @@ pub const Server = struct {
         s.endpoint = try std.fmt.allocPrint(arena, "{s}:{d}", .{ opts.host, opts.port });
 
         const store = try storage_mod.Storage.resolve(arena, opts.database);
-        s.db = try driver.Db.openWith(gpa, store.dsn, .{
+        var failure: OpenFailure = .{};
+        s.db = driver.Db.openWith(gpa, store.dsn, .{
             .pragmas = store.pragmas(),
             .busy_timeout_ms = 5000,
-        });
+            .failure = &failure,
+        }) catch |err| {
+            if (opts.database) |path| blameUnwritableDirectory(io, path, &failure);
+            std.log.err("{f}", .{OpenFailureReport{
+                .path = opts.database orelse ":memory:",
+                .err = err,
+                .failure = &failure,
+                .euid = std.c.geteuid(),
+            }});
+            return error.DatabaseOpenFailed;
+        };
         // Until a job runs, DDL that names only `dataset.table` means this
         // project; each job then sets its own.
         s.db.default_project = s.project;
@@ -3305,6 +3362,81 @@ test "patched dataset fields round-trip through get and list, which is ordered b
     // Patching an undeclared dataset is a miss.
     const missing = try request(s, arena, .PATCH, "/projects/test/datasets/c_ds", "{}");
     try testing.expectEqual(std.http.Status.not_found, missing.status);
+}
+
+fn expectOpenFailure(
+    expected: []const u8,
+    err: driver.Error,
+    failure: OpenFailure,
+) !void {
+    var buf: [512]u8 = undefined;
+    const report: OpenFailureReport = .{
+        .path = "/data/bq.db",
+        .err = err,
+        .failure = &failure,
+        .euid = 65532,
+    };
+    try testing.expectEqualStrings(expected, try std.fmt.bufPrint(&buf, "{f}", .{report}));
+}
+
+test "OpenFailureReport names the file, SQLite's reason and the errno" {
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: unable to open database file (errno ACCES); " ++
+            "uid 65532 needs write access to the file and its directory",
+        error.SQLite,
+        .init(sqlite_c.SQLITE_CANTOPEN, .ACCES, "unable to open database file"),
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: unable to open database file (errno NOENT)",
+        error.SQLite,
+        .init(sqlite_c.SQLITE_CANTOPEN, .NOENT, "unable to open database file"),
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: file is not a database",
+        error.ExecFailed,
+        .init(sqlite_c.SQLITE_NOTADB, .SUCCESS, "file is not a database"),
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: attempt to write a readonly database; " ++
+            "uid 65532 needs write access to the file and its directory",
+        error.ExecFailed,
+        .init(sqlite_c.SQLITE_READONLY, .SUCCESS, "attempt to write a readonly database"),
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: written in a storage format this build " ++
+            "does not read; point --database at a new file",
+        error.IncompatibleStorageFormat,
+        .{},
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: written by goccy/bigquery-emulator, whose " ++
+            "storage this build does not read; point --database at a new file",
+        error.GoccyEmulatorDatabase,
+        .{},
+    );
+    try expectOpenFailure(
+        "cannot open --database=/data/bq.db: OutOfMemory",
+        error.OutOfMemory,
+        .{},
+    );
+}
+
+test "blameUnwritableDirectory names the directory a missing file could not be created in" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(testing.io, "locked", .fromMode(0o555));
+    var buf: [256]u8 = undefined;
+
+    const in_missing = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/absent/x.db", .{tmp.sub_path});
+    var failure: OpenFailure = .init(sqlite_c.SQLITE_CANTOPEN, .NOENT, "");
+    blameUnwritableDirectory(testing.io, in_missing, &failure);
+    try testing.expectEqual(std.posix.E.NOENT, failure.errno);
+
+    // Root may write anywhere, so only another user sees the directory refuse.
+    if (std.c.geteuid() == 0) return error.SkipZigTest;
+    const in_locked = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/locked/x.db", .{tmp.sub_path});
+    blameUnwritableDirectory(testing.io, in_locked, &failure);
+    try testing.expectEqual(std.posix.E.ACCES, failure.errno);
 }
 
 test "declared datasets survive a restart on a file-backed database" {
