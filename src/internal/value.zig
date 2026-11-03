@@ -642,7 +642,15 @@ pub const Value = union(enum) {
             // Go TimestampValue/DatetimeValue.Add: only INTERVAL is accepted
             // (calendar arithmetic); anything else errors.
             .timestamp => |m| switch (v) {
-                .interval => |iv| return Value{ .timestamp = addCalendar(m, iv, 1) },
+                .interval => |iv| {
+                    // BigQuery rejects TIMESTAMP +/- INTERVAL with a non-zero
+                    // MONTH or YEAR part (TIMESTAMP_ADD only accepts up to DAY).
+                    if (iv.years != 0 or iv.months != 0) return fail(
+                        "TIMESTAMP +/- INTERVAL is not supported for intervals with non-zero MONTH or YEAR part.",
+                        error.UnsupportedOperation,
+                    );
+                    return Value{ .timestamp = addCalendar(m, iv, 1) };
+                },
                 else => return fail("failed to use add operator for timestamp", error.UnsupportedOperation),
             },
             .datetime => |m| switch (v) {
@@ -691,7 +699,13 @@ pub const Value = union(enum) {
             // INTERVAL => calendar subtraction; otherwise => the difference as an INTERVAL.
             // TIMESTAMP differences are carried entirely in hours.
             .timestamp => |m| switch (v) {
-                .interval => |iv| return Value{ .timestamp = addCalendar(m, iv, -1) },
+                .interval => |iv| {
+                    if (iv.years != 0 or iv.months != 0) return fail(
+                        "TIMESTAMP +/- INTERVAL is not supported for intervals with non-zero MONTH or YEAR part.",
+                        error.UnsupportedOperation,
+                    );
+                    return Value{ .timestamp = addCalendar(m, iv, -1) };
+                },
                 else => return Value{
                     .interval = intervalFromDuration((m -% (try timeMicrosForCompare(v))) *% 1000),
                 },
@@ -2073,18 +2087,31 @@ fn norm(hi: i64, lo: i64, base: i64) Norm {
     return .{ .hi = h, .lo = l };
 }
 
-/// TimestampValue/DatetimeValue + INTERVAL: calendar arithmetic mirroring Go's
-/// time.Date(y+Y, m+Mo, d+D, h+H, ...) component add with normalization.
+/// TimestampValue/DatetimeValue + INTERVAL: calendar arithmetic matching
+/// BigQuery's AddDatetime (googlesql AdjustYearMonthDay): the month/year part
+/// applies first, clamping the day of month to the last day of the target
+/// month; then days; then the time part, normalizing overflow into days.
+/// This differs from Go's time.Date component add, which normalizes a
+/// past-the-end day into the following month (Jan 31 + 1 month -> Mar 3).
 /// `sign` is +1 for Add, -1 for Sub.
 fn addCalendar(base_micros: i64, iv: Interval, sign: i64) i64 {
     const d = decomposeMicros(base_micros);
-    var year: i64 = d.year + sign * iv.years;
-    var month: i64 = @as(i64, d.month) + sign * iv.months;
-    var day: i64 = @as(i64, d.day) + sign * iv.days;
-    var hour: i64 = @as(i64, d.hour) + sign * iv.hours;
-    var minute: i64 = @as(i64, d.minute) + sign * iv.minutes;
-    var second: i64 = @as(i64, d.second) + sign * iv.seconds;
-    var nsec: i64 = @as(i64, d.micro) * 1000 + sign * iv.sub_second_nanos;
+
+    // Months first, with clamping.
+    const total_months = d.year * 12 + (@as(i64, d.month) - 1) +
+        sign * (@as(i64, iv.years) * 12 + @as(i64, iv.months));
+    const year = @divFloor(total_months, 12);
+    const month = @mod(total_months, 12) + 1;
+    const day = @min(@as(i64, d.day), daysInMonth(year, month));
+
+    // Then days.
+    var days = daysFromCivil(year, month, day) + sign * @as(i64, iv.days);
+
+    // Then the time part, normalizing overflow into days.
+    var hour: i64 = @as(i64, d.hour) + sign * @as(i64, iv.hours);
+    var minute: i64 = @as(i64, d.minute) + sign * @as(i64, iv.minutes);
+    var second: i64 = @as(i64, d.second) + sign * @as(i64, iv.seconds);
+    var nsec: i64 = @as(i64, d.micro) * 1000 + sign * @as(i64, iv.sub_second_nanos);
 
     var r = norm(second, nsec, 1_000_000_000);
     second = r.hi;
