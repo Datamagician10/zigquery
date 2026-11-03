@@ -299,12 +299,6 @@ pub const Server = struct {
 
         switch (router.match(req.method, req.path)) {
             .not_found => {
-                // Go has no 404: unmatched paths fall through to
-                // defaultHandler, which returns 500 internalError
-                // "unexpected request path: ..." (handler.go:3598-3603).
-                // We diverge deliberately: clients retry 5xx until their
-                // deadline, so a 500 for a missing endpoint looks like a
-                // hang instead of an error.
                 return .{
                     .status = .not_found,
                     .body = try errors.body(
