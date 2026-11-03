@@ -298,15 +298,34 @@ pub const Server = struct {
         const arena = req.arena;
 
         switch (router.match(req.method, req.path)) {
-            .not_found, .method_not_allowed => {
+            .not_found => {
                 // Go has no 404: unmatched paths fall through to
                 // defaultHandler, which returns 500 internalError
                 // "unexpected request path: ..." (handler.go:3598-3603).
+                // We diverge deliberately: clients retry 5xx until their
+                // deadline, so a 500 for a missing endpoint looks like a
+                // hang instead of an error.
                 return .{
-                    .status = .internal_server_error,
+                    .status = .not_found,
                     .body = try errors.body(
                         arena,
-                        .internal_error,
+                        .not_found,
+                        try std.fmt.allocPrint(
+                            arena,
+                            "unexpected request path: {s}",
+                            .{req.path},
+                        ),
+                    ),
+                };
+            },
+            .method_not_allowed => {
+                // A known path with the wrong method is a 405, as
+                // BigQuery does. The message stays as it is.
+                return .{
+                    .status = .method_not_allowed,
+                    .body = try errors.body(
+                        arena,
+                        .method_not_allowed,
                         try std.fmt.allocPrint(
                             arena,
                             "unexpected request path: {s}",
