@@ -2122,15 +2122,11 @@ fn addCalendar(base_micros: i64, iv: Interval, sign: i64) i64 {
     r = norm(hour, minute, 60);
     hour = r.hi;
     minute = r.lo;
-    r = norm(day, hour, 24);
-    day = r.hi;
+    r = norm(days, hour, 24);
+    days = r.hi;
     hour = r.lo;
-    r = norm(year, month - 1, 12);
-    year = r.hi;
-    month = r.lo + 1;
 
-    const total_days = daysFromCivil(year, month, 1) + (day - 1);
-    return total_days * day_micros +
+    return days * day_micros +
         hour * hour_micros +
         minute * minute_micros +
         second * second_micros +
@@ -3116,9 +3112,16 @@ test "timestamp / datetime arithmetic and comparison" {
     var buf: [48]u8 = undefined;
 
     const ts = Value{ .timestamp = try parseTimestampMicros("2024-01-31 10:00:00+00") };
-    // + INTERVAL 1 month => Go's time.Date normalizes Jan 31 -> Feb 31 -> Mar 2.
-    const plus_month = try ts.add(alloc, Value{ .interval = .{ .months = 1 } });
-    try std.testing.expectEqualStrings("2024-03-02 10:00:00+00", formatTimestampString(&buf, plus_month.timestamp));
+    // TIMESTAMP + INTERVAL with a MONTH/YEAR part is rejected by BigQuery
+    // (TIMESTAMP_ADD only accepts up to DAY), so it errors here too.
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        ts.add(alloc, Value{ .interval = .{ .months = 1 } }),
+    );
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        ts.sub(alloc, Value{ .interval = .{ .years = 1 } }),
+    );
     // + INTERVAL 1 day.
     const plus_day = try ts.add(alloc, Value{ .interval = .{ .days = 1 } });
     try std.testing.expectEqualStrings("2024-02-01 10:00:00+00", formatTimestampString(&buf, plus_day.timestamp));
@@ -3143,6 +3146,42 @@ test "timestamp / datetime arithmetic and comparison" {
     const iv = Value{ .interval = .{ .days = 1 } };
     try std.testing.expectError(error.UnsupportedOperation, iv.eq(iv));
     try std.testing.expectError(error.UnsupportedOperation, iv.add(alloc, iv));
+}
+
+test "interval arithmetic clamps month-end days like BigQuery" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var buf: [48]u8 = undefined;
+
+    // DATETIME 2021-01-31 + INTERVAL 1 MONTH => 2021-02-28 (not Mar 3).
+    const dt = Value{ .datetime = try parseDatetimeMicros("2021-01-31 00:00:00") };
+    const plus_month = try dt.add(alloc, Value{ .interval = .{ .months = 1 } });
+    try std.testing.expectEqualStrings("2021-02-28 00:00:00", formatDatetimeString(&buf, plus_month.datetime));
+
+    // DATE 2021-03-31 - INTERVAL 1 MONTH => DATETIME 2021-02-28.
+    const date = Value{ .date = try parseDateDays("2021-03-31") };
+    const minus_month = try date.sub(alloc, Value{ .interval = .{ .months = 1 } });
+    try std.testing.expectEqualStrings("2021-02-28 00:00:00", formatDatetimeString(&buf, minus_month.datetime));
+
+    // DATETIME 2020-02-29 + INTERVAL 1 YEAR => 2021-02-28 (leap day clamps).
+    const leap = Value{ .datetime = try parseDatetimeMicros("2020-02-29 00:00:00") };
+    const plus_year = try leap.add(alloc, Value{ .interval = .{ .years = 1 } });
+    try std.testing.expectEqualStrings("2021-02-28 00:00:00", formatDatetimeString(&buf, plus_year.datetime));
+
+    // Months clamp first, then days: Jan 31 + 1 month + 1 day => Mar 1.
+    const plus_month_day = try dt.add(alloc, Value{ .interval = .{ .months = 1, .days = 1 } });
+    try std.testing.expectEqualStrings("2021-03-01 00:00:00", formatDatetimeString(&buf, plus_month_day.datetime));
+
+    // Time part applies after the clamp and normalizes into the next day.
+    const late = Value{ .datetime = try parseDatetimeMicros("2021-01-31 23:00:00") };
+    const plus_month_hours = try late.add(alloc, Value{ .interval = .{ .months = 1, .hours = 2 } });
+    try std.testing.expectEqualStrings("2021-03-01 01:00:00", formatDatetimeString(&buf, plus_month_hours.datetime));
+
+    // A mid-month date is unaffected by the clamp.
+    const mid = Value{ .datetime = try parseDatetimeMicros("2021-03-15 12:30:00") };
+    const mid_plus = try mid.add(alloc, Value{ .interval = .{ .months = 1 } });
+    try std.testing.expectEqualStrings("2021-04-15 12:30:00", formatDatetimeString(&buf, mid_plus.datetime));
 }
 
 test "time-kind conversions (ToInt64 / ToFloat64 / ToString)" {
