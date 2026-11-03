@@ -1570,12 +1570,12 @@ pub const Server = struct {
                 server: *Server,
                 a: std.mem.Allocator,
                 p: []const u8,
-                endpoint: []const u8,
+                ep: []const u8,
                 id: []const u8,
                 sp: load_handler.LoadSpec,
                 seconds: i64,
             ) !http_server.Response {
-                return server.storeLoadJob(a, p, endpoint, id, sp, seconds, .{
+                return server.storeLoadJob(a, p, ep, id, sp, seconds, .{
                     .failed = .{
                         .reason = "invalid",
                         .message = "Error while reading data, error message: " ++
@@ -2523,6 +2523,67 @@ test "jobs.insert binds a positional parameter" {
     ), "");
     try testing.expectEqual(std.http.Status.ok, got.status);
     try testing.expectEqualStrings("6", try onlyCell(arena, got.body));
+}
+
+test "jobs.insert selfLink uses the request Host header, not the bind address" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    // The issue's repro, verbatim: a client reaching the emulator as
+    // bigquery-emulator:9050 must not be handed http://0.0.0.0:9050/....
+    const req = http_server.Request{
+        .method = .POST,
+        .path = "/projects/test/jobs",
+        .body =
+        \\{"configuration":{"query":{"query":"SELECT 1 AS i","useLegacySql":false}}}
+        ,
+        .headers = .{ .host = "bigquery-emulator:9050" },
+        .arena = arena,
+    };
+    const res = try s.handler().func(s.handler().ctx, &req);
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        res.body,
+        "\"selfLink\":\"http://bigquery-emulator:9050/bigquery/v2/projects/test/jobs/",
+    ) != null);
+    // jobs.get serves the stored resource verbatim, so it carries the
+    // same Host-derived link even when the poll sends no Host header.
+    const job_id = try jobIdOf(arena, res.body);
+    const got = try request(s, arena, .GET, try std.fmt.allocPrint(
+        arena,
+        "/projects/test/jobs/{s}",
+        .{job_id},
+    ), "");
+    try testing.expectEqual(std.http.Status.ok, got.status);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        got.body,
+        "\"selfLink\":\"http://bigquery-emulator:9050/bigquery/v2/projects/test/jobs/",
+    ) != null);
+}
+
+test "jobs.insert selfLink falls back to the bind address without a Host header" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"query":{"query":"SELECT 1 AS i","useLegacySql":false}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        res.body,
+        "\"selfLink\":\"http://0.0.0.0:9050/bigquery/v2/projects/test/jobs/",
+    ) != null);
 }
 
 test "a parameterized query with a value missing still reports the arity error" {
