@@ -38,6 +38,7 @@ import concurrent.futures
 import datetime
 import decimal
 import math
+import os
 import re
 import subprocess
 import sys
@@ -165,6 +166,21 @@ def canon_engine_cell(s, container=False):
     # Nested: normalise the spacing rather than splitting, which a comma inside
     # an element would break.
     return re.sub(r"([,:])\s+", r"\1", s)
+
+
+def resolve_engine(path=ENGINE):
+    """Absolute path of the engine binary, or a loud failure.
+
+    A missing binary used to surface as one `error` verdict per case, after
+    a run that looked like it had measured something. Fail before any case
+    runs instead, naming the build command from the module docstring.
+    """
+    if not os.path.isfile(path):
+        sys.exit(f"vsbq: engine binary not found: {path}\n"
+                 "build it first: zig build -Drelease=true")
+    if not os.access(path, os.X_OK):
+        sys.exit(f"vsbq: engine binary is not executable: {path}")
+    return os.path.abspath(path)
 
 
 def run_engine(sql):
@@ -305,6 +321,9 @@ def main():
     ap.add_argument("--quiet", action="store_true",
                     help="report real divergences only")
     args = ap.parse_args()
+
+    global ENGINE
+    ENGINE = resolve_engine()
 
     todo = [c for p in args.paths for c in cases(p)]
     print(f"-- {len(todo)} cases, {args.jobs} at a time, project {args.project}\n")
