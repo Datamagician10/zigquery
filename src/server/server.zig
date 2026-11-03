@@ -3175,7 +3175,7 @@ test "two jobs' destination tables do not collide in the shared dataset" {
     }
 }
 
-test "an unknown path is a 500, matching Go's defaultHandler" {
+test "an unknown path is a 404, not Go's 500" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -3184,7 +3184,24 @@ test "an unknown path is a 500, matching Go's defaultHandler" {
     defer s.deinit();
 
     const res = try request(s, arena, .GET, "/no/such/path", "");
-    try testing.expectEqual(std.http.Status.internal_server_error, res.status);
+    try testing.expectEqual(std.http.Status.not_found, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "notFound") != null);
+    try testing.expect(std.mem.indexOf(u8, res.body, "unexpected request path") != null);
+}
+
+test "a known path with the wrong method is a 405" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    // /projects/*/queries is a POST-only route, so DELETE is a method
+    // mismatch, not a missing path.
+    const res = try request(s, arena, .DELETE, "/projects/test/queries", "");
+    try testing.expectEqual(std.http.Status.method_not_allowed, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "methodNotAllowed") != null);
     try testing.expect(std.mem.indexOf(u8, res.body, "unexpected request path") != null);
 }
 
