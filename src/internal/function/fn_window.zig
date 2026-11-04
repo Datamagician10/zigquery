@@ -161,6 +161,17 @@ pub const WINDOW_ARRAY_AGG = struct {
         alloc: std.mem.Allocator,
         agg: *WindowFuncAggregatedStatus,
     ) Error!Value {
+        // BigQuery rejects this combination for the analytic function only:
+        // the GROUP BY aggregate keeps IGNORE NULLS. RESPECT NULLS emits no
+        // marker on the analytic path (it is the default), so an explicit
+        // RESPECT NULLS is indistinguishable here and is not rejected.
+        if (agg.opt.ignore_nulls) {
+            return bind.fail(
+                "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
+                .{},
+                error.UnsupportedOperation,
+            );
+        }
         return value_mod.arrayValue(alloc, try agg.relevantValues());
     }
 };
@@ -294,6 +305,17 @@ pub const WINDOW_STRING_AGG = struct {
         alloc: std.mem.Allocator,
         agg: *WindowFuncAggregatedStatus,
     ) Error!Value {
+        // BigQuery rejects DISTINCT for the analytic function; the GROUP BY
+        // aggregate keeps it, and other analytic aggregates (MIN, SUM,
+        // COUNT) keep DISTINCT too, so this is per-function, not a blanket
+        // ban on DISTINCT in a window.
+        if (agg.opt.distinct) {
+            return bind.fail(
+                "Analytic function string_agg does not support DISTINCT.",
+                .{},
+                error.UnsupportedOperation,
+            );
+        }
         var out: std.ArrayList(u8) = .empty;
         var wrote = false;
         for (try agg.relevantValues()) |v| {
