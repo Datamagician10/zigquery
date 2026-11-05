@@ -1021,6 +1021,53 @@ test "relevantValues honors ignore_nulls and distinct" {
     try testing.expectEqual(@as(usize, 3), (try agg.relevantValues()).len);
 }
 
+test "analytic string_agg rejects DISTINCT, array_agg rejects IGNORE NULLS" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // STRING_AGG(DISTINCT x) OVER (): BigQuery refuses to plan it.
+    var agg = WindowFuncAggregatedStatus{ .cache_alloc = alloc };
+    try agg.step(alloc, .{ .string = "a" });
+    try agg.step(alloc, .{ .string = "b" });
+    try agg.step(alloc, .{ .string = "a" });
+    var opt = agg.opt;
+    opt.distinct = true;
+    agg.setOption(opt);
+    var f = WINDOW_STRING_AGG{};
+    try testing.expectError(error.UnsupportedOperation, f.done(alloc, &agg));
+    try testing.expectEqualStrings(
+        "Analytic function string_agg does not support DISTINCT.",
+        bind.message.?,
+    );
+    // Without DISTINCT the same frame still aggregates, duplicates included.
+    opt.distinct = false;
+    agg.setOption(opt);
+    try value_mod.expectValueEqual(.{ .string = "a,b,a" }, try f.done(alloc, &agg));
+
+    // ARRAY_AGG(x IGNORE NULLS) OVER (): BigQuery refuses to plan it.
+    var agg2 = WindowFuncAggregatedStatus{ .cache_alloc = alloc };
+    try agg2.step(alloc, .{ .int = 1 });
+    try agg2.step(alloc, .null);
+    try agg2.step(alloc, .{ .int = 2 });
+    var opt2 = agg2.opt;
+    opt2.ignore_nulls = true;
+    agg2.setOption(opt2);
+    var g = WINDOW_ARRAY_AGG{};
+    try testing.expectError(error.UnsupportedOperation, g.done(alloc, &agg2));
+    try testing.expectEqualStrings(
+        "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
+        bind.message.?,
+    );
+    // Without IGNORE NULLS the NULL stays in the array.
+    opt2.ignore_nulls = false;
+    agg2.setOption(opt2);
+    try value_mod.expectValueEqual(
+        try value_mod.arrayValue(alloc, &.{ .{ .int = 1 }, .null, .{ .int = 2 } }),
+        try g.done(alloc, &agg2),
+    );
+}
+
 test "inverse removes the oldest matching scalar" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
