@@ -37,7 +37,9 @@ import base64
 import concurrent.futures
 import datetime
 import decimal
+import json
 import math
+import pathlib
 import re
 import subprocess
 import sys
@@ -45,7 +47,14 @@ import threading
 
 from google.cloud import bigquery
 
-ENGINE = "./zig-out/bin/zigquery"
+ENGINE = "./zig-out/bin/zigquery-cli"
+# The CLI's --json mode prints one object, {"columns": [...], "rows": [[...]]},
+# with each cell typed: a string stays a string, NULL stays null, a TIMESTAMP
+# is epoch seconds as a number, bytes are base64. That is what makes a value
+# containing a tab comparable at all — the old TSV split read a tab inside a
+# value as a column boundary and flagged a divergence that did not exist
+# (issue #43). The cells are canonicalised in compare(); no container guessing
+# is needed anymore, because the JSON says which cells are containers.
 
 # `.sql = "..."` on one line, or a `\\`-prefixed multiline block.
 DESC = re.compile(r'\s*\.desc = "((?:[^"\\]|\\.)*)"')
@@ -96,19 +105,21 @@ FRACTION = re.compile(r"(\d{2}:\d{2}:\d{2})\.(\d+)")
 def trim_fraction(s):
     """Fractional seconds without trailing zeros. BigQuery's string form and the
     CLI both drop them; Python's isoformat pads to six digits."""
+
     def sub(m):
         digits = m.group(2).rstrip("0")
         return m.group(1) + ("." + digits if digits else "")
+
     return FRACTION.sub(sub, s)
 
 
 def canon(v):
     """One canonical string for a cell, from either side.
 
-    The client returns native Python values and the CLI returns text, so each
-    kind is mapped onto whichever spelling the other already uses: a TIMESTAMP
-    onto the CLI's epoch seconds, BYTES onto its base64, and DATE / DATETIME /
-    TIME onto their ISO forms.
+    The client returns native Python values and the CLI returns JSON values,
+    so each kind is mapped onto whichever spelling the other already uses: a
+    TIMESTAMP onto the CLI's epoch seconds, BYTES onto its base64, and DATE /
+    DATETIME / TIME onto their ISO forms.
     """
     if v is None:
         return "NULL"
@@ -147,38 +158,17 @@ def canon(v):
     return f"{f:.6f}".rstrip("0").rstrip(".")
 
 
-def canon_engine_cell(s, container=False):
-    """The CLI prints containers as `[a, b]` and `{k: v}`; canon() emits them
-    without the spaces.
-
-    Whether a cell *is* a container has to be told, not guessed: the CLI's TSV
-    carries no types, and `FORMAT("[%\'d]", 1000)` produces `[1,000]`, which
-    guessing reads as a two-element array. BigQuery's side knows the schema, so
-    its value decides.
-    """
-    s = s.strip()
-    if not container:
-        return canon(s)
-    if s[:1] == "[" and s[-1:] == "]" and not re.search(r"[\[{]", s[1:-1]):
-        inner = s[1:-1].strip()
-        return "[]" if not inner else "[" + ",".join(canon(p) for p in inner.split(",")) + "]"
-    # Nested: normalise the spacing rather than splitting, which a comma inside
-    # an element would break.
-    return re.sub(r"([,:])\s+", r"\1", s)
-
-
 def run_engine(sql):
-    p = subprocess.run([ENGINE, sql], capture_output=True, text=True, timeout=180)
+    p = subprocess.run([ENGINE, "--json", sql], capture_output=True, text=True,
+                       timeout=180)
     out = (p.stdout or "") + (p.stderr or "")
     if "error:" in out:
         return None, out.strip().splitlines()[-1][:200]
-    lines = [l for l in out.split("\n") if l.strip()]
-    if not lines:
-        return [], None
-    header = lines[0].split("\t")
-    # Raw: the cells are canonicalised in compare(), where BigQuery's schema
-    # says which of them are containers.
-    return [dict(zip(header, l.split("\t"))) for l in lines[1:]], None
+    try:
+        doc = json.loads(out)
+    except json.JSONDecodeError as e:
+        return None, f"bad --json output: {e}"[:200]
+    return [dict(zip(doc["columns"], row)) for row in doc["rows"]], None
 
 
 _local = threading.local()
@@ -239,12 +229,8 @@ def classify(ours, theirs):
             and any(x != y for ro, rt in zip(ours, theirs)
                     for x, y in zip(ro.values(), rt.values()))):
         return "render"
-    ovals = [sorted(r.values()) for r in ours]
-    bvals = [sorted(r.values()) for r in theirs]
-    if ovals == bvals:
-        return "name"
     key = lambda rows: sorted(tuple(sorted(r.items())) for r in rows)
-    if key(ours) == key(theirs) or sorted(map(tuple, ovals)) == sorted(map(tuple, bvals)):
+    if key(ours) == key(theirs):
         return "order"
     return "diff"
 
@@ -259,41 +245,85 @@ def compare(case, project):
         return "error", spec, desc, sql, f"{type(e).__name__}: {e}"[:240], None, None, None, False
 
 
+ANONYMOUS_COLUMN_RE_ENGINE = re.compile(r"\$col\d+")
+ANONYMOUS_COLUMN_RE_BQ = re.compile(r"f\d+_")
+
+
+def same_name(ko, kt):
+    """Whether two anonymous columns name the same column."""
+    if ko == kt:
+        return True
+
+    return bool(
+        ANONYMOUS_COLUMN_RE_ENGINE.fullmatch(ko)
+        and kt is not None
+        and ANONYMOUS_COLUMN_RE_BQ.fullmatch(kt)
+    )
+
+
 def align(ours, theirs):
     """Canonicalise both sides, pairing columns by name where the two agree on
     them and by position otherwise (an anonymous column is `$col1` here and
-    `f0_` there)."""
-    out_o, out_t = [], []
+    `f0_` there).
+
+    Returns the two row lists and whether any column is named differently, so
+    a renamed column is reported rather than absorbed by positional pairing."""
+    out_o, out_t, names_differ = [], [], False
     for ro, rt in zip(ours, theirs):
         keys_t = list(rt)
         by_name = set(ro) == set(keys_t)
         co, ct = {}, {}
         for i, ko in enumerate(ro):
             kt = ko if by_name else (keys_t[i] if i < len(keys_t) else None)
+            if not by_name and not same_name(ko, kt):
+                names_differ = True
             tval = rt.get(kt) if kt is not None else None
             name = ko if by_name else f"c{i}"
-            co[name] = canon_engine_cell(ro[ko], isinstance(tval, (list, dict)))
-            ct[name] = canon(tval)
+            if isinstance(tval, str):
+                # A STRING cell is compared as text: canon() would read "1e+14" and
+                # "100000000000000" as the same number.
+                co[name] = ro[ko].strip()
+                ct[name] = tval.strip()
+            else:
+                co[name] = canon(ro[ko])
+                ct[name] = canon(tval)
         out_o.append(co)
         out_t.append(ct)
-    return out_o, out_t
+    return out_o, out_t, names_differ
 
 
 def _compare(case, project):
     spec, desc, sql = case
     ours, oerr = run_engine(sql)
     theirs, berr, cached = run_bq(sql, project)
+    names_differ = False
     if not (oerr or berr):
         if len(ours) != len(theirs):
-            ours = [{k: canon_engine_cell(v) for k, v in r.items()} for r in ours]
+            ours = [{k: canon(v) for k, v in r.items()} for r in ours]
             theirs = [{k: canon(v) for k, v in r.items()} for r in theirs]
         else:
-            ours, theirs = align(ours, theirs)
+            ours, theirs, names_differ = align(ours, theirs)
     if oerr or berr:
         # Both refusing is agreement about the language, not a divergence.
         verdict = "both-reject" if (oerr and berr) else "error"
         return verdict, spec, desc, sql, oerr, berr, ours, theirs, cached
-    return classify(ours, theirs), spec, desc, sql, None, None, ours, theirs, cached
+    verdict = classify(ours, theirs)
+    if verdict == "agree" and names_differ:
+        verdict = "name"
+    return verdict, spec, desc, sql, None, None, ours, theirs, cached
+
+
+def check_engine():
+    """Refuse a missing or stale engine binary."""
+    engine = pathlib.Path(ENGINE)
+    if not engine.exists():
+        sys.exit(f"{ENGINE} not found; build it with `zig build -Drelease=true`")
+    built = engine.stat().st_mtime
+    sources = [p for d in ("src", "entrypoints") for p in pathlib.Path(d).rglob("*.zig")]
+    newer = [p for p in sources if p.stat().st_mtime > built]
+    if newer:
+        sys.exit(f"{ENGINE} is older than {len(newer)} source file(s), e.g. {newer[0]}; "
+                 "rebuild with `zig build -Drelease=true`")
 
 
 def main():
@@ -305,6 +335,8 @@ def main():
     ap.add_argument("--quiet", action="store_true",
                     help="report real divergences only")
     args = ap.parse_args()
+
+    check_engine()
 
     todo = [c for p in args.paths for c in cases(p)]
     print(f"-- {len(todo)} cases, {args.jobs} at a time, project {args.project}\n")
