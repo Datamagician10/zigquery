@@ -9,6 +9,7 @@ const zigquery = @import("zigquery");
 const spec_mod = zigquery.spec;
 const autodetect = @import("autodetect.zig");
 const csv = @import("csv.zig");
+const rowvalue = @import("types/rowvalue.zig");
 const schema_mod = @import("types/schema.zig");
 const load_handler = @import("../handler/jobs.load.zig");
 const pb = @import("../proto/bigquery.zig");
@@ -18,7 +19,6 @@ pub const Error = error{
     NoSchema,
     /// A JSON line that is not an object, or a member this emulator does not read.
     NotAnObject,
-    NestedJson,
     MalformedJson,
     MalformedCsv,
 } || std.mem.Allocator.Error;
@@ -68,8 +68,6 @@ pub fn readErrorMessage(err: Error) []const u8 {
         error.NoSchema => "the load names no schema: supply one, enable autodetect, or " ++
             "load into an existing table",
         error.NotAnObject => "every line of NEWLINE_DELIMITED_JSON data must be an object",
-        error.NestedJson => "nested and repeated fields are not read from " ++
-            "NEWLINE_DELIMITED_JSON",
         error.MalformedJson => "the data is not newline-delimited JSON",
         error.MalformedCsv => "the data is not readable as CSV",
         error.OutOfMemory => "out of memory",
@@ -488,7 +486,6 @@ fn readJson(
             continue;
         };
         if (value != .object) return error.NotAnObject;
-        try requireFlat(value.object);
         try objects.append(value);
     }
 
@@ -498,60 +495,208 @@ fn readJson(
     };
 
     const schema_node = try schemaNodeFrom(arena, columns);
+    const schema_fields = fieldsOf(schema_node);
+    for (objects.items) |*row| {
+        try normalizeJsonRow(arena, &row.object, schema_fields);
+    }
     return .{
         .schema_node = schema_node,
-        .schema_fields = fieldsOf(schema_node),
+        .schema_fields = schema_fields,
         .columns = columns,
         .source = .{ .json = objects.items },
         .bad_records = bad,
     };
 }
 
-/// Flat objects only: a nested object or an array would have to become a RECORD or a repeated
-/// column.
-fn requireFlat(object: std.json.ObjectMap) Error!void {
-    for (object.values()) |value| {
-        switch (value) {
-            .object, .array => return error.NestedJson,
-            else => {},
+/// BigQuery reads an omitted or null REPEATED field as an empty array, at
+/// every depth of a row, where an omitted or null RECORD is the NULL the row
+/// already says. The parsed rows are rewritten to the REPEATED rule, so the
+/// write path stores what BigQuery stores. The same rule on the streaming
+/// write path is #114.
+fn normalizeJsonRow(
+    arena: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    fields: []const std.json.Value,
+) std.mem.Allocator.Error!void {
+    for (fields) |field| {
+        const name = rowvalue.stringOf(field, "name");
+        const subs = rowvalue.fieldsOf(field);
+        if (std.mem.eql(u8, rowvalue.stringOf(field, "mode"), "REPEATED")) {
+            const held = object.getPtr(name);
+            if (held == null or held.?.* == .null) {
+                try object.put(arena, name, .{ .array = std.json.Array.init(arena) });
+                continue;
+            }
+            if (held.?.* == .array and subs.len > 0) {
+                for (held.?.array.items) |*item| {
+                    if (item.* == .object) {
+                        try normalizeJsonRow(arena, &item.object, subs);
+                    }
+                }
+            }
+            continue;
+        }
+        if (subs.len > 0) {
+            if (object.getPtr(name)) |held| {
+                if (held.* == .object) {
+                    try normalizeJsonRow(arena, &held.object, subs);
+                }
+            }
         }
     }
 }
 
-const SeenColumn = struct {
+/// The shape the values under one name give it: a scalar kind, a RECORD with
+/// a shape per member, or a REPEATED with one shape for its elements.
+const JsonShape = struct {
+    kind: autodetect.Kind = .unknown,
+    record: bool = false,
+    repeated: bool = false,
+    fields: []const SeenField = &.{},
+    elem: ?*JsonShape = null,
+};
+
+const SeenField = struct {
     name: []const u8,
-    kind: autodetect.Kind,
+    shape: JsonShape,
 };
 
 /// Column names in the order they first appear, typed from the values under them.
 fn jsonColumns(arena: std.mem.Allocator, rows: []const std.json.Value) ![]const Column {
-    var seen: std.ArrayList(SeenColumn) = .empty;
+    var seen: std.ArrayList(SeenField) = .empty;
     for (rows) |row| {
         var it = row.object.iterator();
         while (it.next()) |entry| {
-            try noteColumn(arena, &seen, entry.key_ptr.*, jsonKind(entry.value_ptr.*));
+            const shape = try jsonShape(arena, entry.value_ptr.*);
+            var merged = false;
+            for (seen.items) |*column| {
+                if (!std.mem.eql(u8, column.name, entry.key_ptr.*)) continue;
+                column.shape = try mergeShapes(arena, column.shape, shape);
+                merged = true;
+                break;
+            }
+            if (!merged) {
+                try seen.append(arena, .{ .name = entry.key_ptr.*, .shape = shape });
+            }
         }
     }
     const out = try arena.alloc(Column, seen.items.len);
     for (out, seen.items) |*column, s| {
-        column.* = .{ .name = s.name, .type_name = s.kind.legacyTypeName() };
+        column.* = try shapeColumn(arena, s.name, s.shape);
     }
     return out;
 }
 
-/// Widens a column already seen to take `kind`, or adds it after the others.
-fn noteColumn(
-    arena: std.mem.Allocator,
-    seen: *std.ArrayList(SeenColumn),
-    name: []const u8,
-    kind: autodetect.Kind,
-) !void {
-    for (seen.items) |*column| {
-        if (!std.mem.eql(u8, column.name, name)) continue;
-        column.kind = autodetect.merge(column.kind, kind);
-        return;
+fn jsonShape(arena: std.mem.Allocator, value: std.json.Value) !JsonShape {
+    switch (value) {
+        .object => |object| {
+            var fields: std.ArrayList(SeenField) = .empty;
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                try fields.append(arena, .{
+                    .name = entry.key_ptr.*,
+                    .shape = try jsonShape(arena, entry.value_ptr.*),
+                });
+            }
+            return .{ .record = true, .fields = fields.items };
+        },
+        .array => |array| {
+            var elem: JsonShape = .{};
+            for (array.items) |item| {
+                elem = try mergeShapes(arena, elem, try jsonShape(arena, item));
+            }
+            const held = try arena.create(JsonShape);
+            held.* = elem;
+            return .{ .repeated = true, .elem = held };
+        },
+        else => return .{ .kind = jsonKind(value) },
     }
-    try seen.append(arena, .{ .name = name, .kind = kind });
+}
+
+/// The one shape that takes both: an unseen value yields, two RECORDs union
+/// their members, two REPEATEDs merge their elements, and two scalars widen
+/// the way CSV detection widens. Shapes no single column holds — an object
+/// against a scalar, an array against a non-array, an array of arrays, which
+/// BigQuery has no column for — fall back to STRING, and the values are left
+/// to the write path's checks, as a mismatched CSV cell is.
+fn mergeShapes(
+    arena: std.mem.Allocator,
+    a: JsonShape,
+    b: JsonShape,
+) std.mem.Allocator.Error!JsonShape {
+    if (isUnknownShape(a)) return b;
+    if (isUnknownShape(b)) return a;
+    if (a.repeated and b.repeated) {
+        const elem = try arena.create(JsonShape);
+        elem.* = try mergeShapes(arena, a.elem.?.*, b.elem.?.*);
+        return .{ .repeated = true, .elem = elem };
+    }
+    if (a.record and b.record) {
+        var fields: std.ArrayList(SeenField) = .empty;
+        try fields.appendSlice(arena, a.fields);
+        for (b.fields) |bf| {
+            var merged = false;
+            for (fields.items) |*af| {
+                if (!std.mem.eql(u8, af.name, bf.name)) continue;
+                af.shape = try mergeShapes(arena, af.shape, bf.shape);
+                merged = true;
+                break;
+            }
+            if (!merged) try fields.append(arena, bf);
+        }
+        return .{ .record = true, .fields = fields.items };
+    }
+    if (!a.record and !a.repeated and !b.record and !b.repeated) {
+        return .{ .kind = autodetect.merge(a.kind, b.kind) };
+    }
+    return .{ .kind = .string };
+}
+
+fn isUnknownShape(shape: JsonShape) bool {
+    return !shape.record and !shape.repeated and shape.kind == .unknown;
+}
+
+fn shapeColumn(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    shape: JsonShape,
+) std.mem.Allocator.Error!Column {
+    if (shape.repeated) {
+        const elem = shape.elem.?.*;
+        if (elem.repeated) return .{ .name = name, .type_name = "STRING" };
+        if (elem.record) {
+            return .{
+                .name = name,
+                .type_name = "RECORD",
+                .mode = "REPEATED",
+                .fields = try shapeFieldNodes(arena, elem.fields),
+            };
+        }
+        return .{
+            .name = name,
+            .type_name = elem.kind.legacyTypeName(),
+            .mode = "REPEATED",
+        };
+    }
+    if (shape.record) {
+        return .{
+            .name = name,
+            .type_name = "RECORD",
+            .fields = try shapeFieldNodes(arena, shape.fields),
+        };
+    }
+    return .{ .name = name, .type_name = shape.kind.legacyTypeName() };
+}
+
+fn shapeFieldNodes(
+    arena: std.mem.Allocator,
+    fields: []const SeenField,
+) std.mem.Allocator.Error![]const std.json.Value {
+    const out = try arena.alloc(std.json.Value, fields.len);
+    for (fields, out) |field, *node| {
+        node.* = try columnNode(arena, try shapeColumn(arena, field.name, field.shape));
+    }
+    return out;
 }
 
 fn jsonKind(value: std.json.Value) autodetect.Kind {
@@ -736,19 +881,130 @@ test "a declared RECORD schema reaches the reading with its mode and members" {
     try testing.expectEqualStrings("ts", subs[1].object.get("name").?.string);
 }
 
-test "a nested JSON value is refused rather than half read" {
+/// The shape of #119's table: an INTEGER, a REPEATED RECORD, and a RECORD
+/// holding a REPEATED member of its own.
+fn nestedSchema(arena: std.mem.Allocator) !*const pb.TableSchema {
+    const n = try arena.create(pb.TableFieldSchema);
+    n.* = .{ .name = "n", .type = "INTEGER" };
+    const ts = try arena.create(pb.TableFieldSchema);
+    ts.* = .{ .name = "ts", .type = "TIMESTAMP" };
+    const entries = try arena.create(pb.TableFieldSchema);
+    entries.* = .{
+        .name = "entries",
+        .type = "RECORD",
+        .mode = "REPEATED",
+        .fields = try arena.dupe(*pb.TableFieldSchema, &.{ n, ts }),
+    };
+    const city = try arena.create(pb.TableFieldSchema);
+    city.* = .{ .name = "city", .type = "STRING" };
+    const aliases = try arena.create(pb.TableFieldSchema);
+    aliases.* = .{ .name = "aliases", .type = "STRING", .mode = "REPEATED" };
+    const profile = try arena.create(pb.TableFieldSchema);
+    profile.* = .{
+        .name = "profile",
+        .type = "RECORD",
+        .fields = try arena.dupe(*pb.TableFieldSchema, &.{ city, aliases }),
+    };
+    const id = try arena.create(pb.TableFieldSchema);
+    id.* = .{ .name = "id", .type = "INTEGER" };
+    const schema = try arena.create(pb.TableSchema);
+    schema.* = .{
+        .fields = try arena.dupe(*pb.TableFieldSchema, &.{ id, entries, profile }),
+    };
+    return schema;
+}
+
+test "nested values land as they were written, with BigQuery's null rules" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    try testing.expectError(error.NestedJson, readFrom(arena,
-        \\{"a":{"b":1}}
+    const spec = load_handler.LoadSpec{
+        .destination = .{ .project_id = "p", .dataset_id = "d", .table_id = "t" },
+        .source_format = .NEWLINE_DELIMITED_JSON,
+        .schema = try nestedSchema(arena),
+    };
+    const reading = try readFrom(arena,
+        \\{"id":1,"entries":[{"n":1,"ts":"2026-01-15T00:00:00Z"},{"n":2,"ts":"2026-01-16T00:00:00Z"}],"profile":{"city":"SF"}}
+        \\{"id":2,"entries":[]}
+        \\{"id":3,"entries":null,"profile":null}
         \\
-    , .{
+    , spec);
+    const got = try collect(arena, reading, spec);
+    try testing.expectEqual(@as(u64, 0), got.bad_records);
+    try testing.expectEqual(@as(usize, 3), got.rows.len);
+
+    const first = got.rows[0];
+    const entries = first.object.get("entries").?.array.items;
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqual(@as(i64, 1), entries[0].object.get("n").?.integer);
+    try testing.expectEqualStrings(
+        "2026-01-16T00:00:00Z",
+        entries[1].object.get("ts").?.string,
+    );
+    const profile = first.object.get("profile").?.object;
+    try testing.expectEqualStrings("SF", profile.get("city").?.string);
+    // A REPEATED member the object omits is an empty array, not a NULL.
+    try testing.expectEqual(
+        @as(usize, 0),
+        profile.get("aliases").?.array.items.len,
+    );
+
+    // An empty array stays empty; a null REPEATED reads as one too, and a
+    // null or absent RECORD stays null.
+    try testing.expectEqual(
+        @as(usize, 0),
+        got.rows[1].object.get("entries").?.array.items.len,
+    );
+    try testing.expectEqual(
+        std.json.Value.null,
+        got.rows[1].object.get("profile") orelse .null,
+    );
+    try testing.expectEqual(
+        @as(usize, 0),
+        got.rows[2].object.get("entries").?.array.items.len,
+    );
+    try testing.expectEqual(
+        std.json.Value.null,
+        got.rows[2].object.get("profile").?,
+    );
+}
+
+test "autodetect types a nested object as RECORD and an array as REPEATED" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const spec = load_handler.LoadSpec{
         .destination = .{ .project_id = "p", .dataset_id = "d", .table_id = "t" },
         .source_format = .NEWLINE_DELIMITED_JSON,
         .autodetect = true,
-    }));
+    };
+    const reading = try readFrom(arena,
+        \\{"id":1,"entries":[{"n":1}],"tags":["a","b"]}
+        \\{"id":2,"entries":[],"tags":[]}
+        \\
+    , spec);
+    try testing.expectEqualDeep(
+        @as([]const []const u8, &.{ "INTEGER", "RECORD", "STRING" }),
+        try columnTypes(arena, reading),
+    );
+    const entries = reading.schema_fields[1];
+    try testing.expectEqualStrings("REPEATED", entries.object.get("mode").?.string);
+    const member = entries.object.get("fields").?.array.items[0];
+    try testing.expectEqualStrings("n", member.object.get("name").?.string);
+    try testing.expectEqualStrings("INTEGER", member.object.get("type").?.string);
+    try testing.expectEqualStrings(
+        "REPEATED",
+        reading.schema_fields[2].object.get("mode").?.string,
+    );
+
+    const got = try collect(arena, reading, spec);
+    try testing.expectEqual(@as(usize, 2), got.rows.len);
+    try testing.expectEqual(
+        @as(usize, 0),
+        got.rows[1].object.get("entries").?.array.items.len,
+    );
 }
 
 test "a load that names no schema at all cannot proceed" {
