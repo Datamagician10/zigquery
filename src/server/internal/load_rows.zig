@@ -53,8 +53,14 @@ pub const Source = union(enum) {
 
 const Column = struct {
     name: []const u8,
-    /// A legacy REST type name.
+    /// A legacy REST type name. For a REPEATED column, the element's name:
+    /// ARRAY<RECORD<...>> is a RECORD the mode marks REPEATED, the way the
+    /// REST API writes it.
     type_name: []const u8,
+    /// NULLABLE, REQUIRED or REPEATED. NULLABLE when the source said nothing.
+    mode: []const u8 = "NULLABLE",
+    /// A RECORD column's members, as schema nodes. Empty for a scalar.
+    fields: []const std.json.Value = &.{},
 };
 
 pub fn readErrorMessage(err: Error) []const u8 {
@@ -163,7 +169,26 @@ fn schemaColumns(arena: std.mem.Allocator, schema: *const pb.TableSchema) ![]con
         column.* = .{
             .name = field.name orelse "",
             .type_name = field.type orelse "STRING",
+            .mode = field.mode orelse "NULLABLE",
+            .fields = try pbFieldNodes(arena, field.fields),
         };
+    }
+    return out;
+}
+
+/// A posted field's RECORD members as schema nodes, recursively.
+fn pbFieldNodes(
+    arena: std.mem.Allocator,
+    fields: []const *pb.TableFieldSchema,
+) std.mem.Allocator.Error![]const std.json.Value {
+    const out = try arena.alloc(std.json.Value, fields.len);
+    for (fields, out) |field, *node| {
+        node.* = try columnNode(arena, .{
+            .name = field.name orelse "",
+            .type_name = field.type orelse "STRING",
+            .mode = field.mode orelse "NULLABLE",
+            .fields = try pbFieldNodes(arena, field.fields),
+        });
     }
     return out;
 }
@@ -171,12 +196,62 @@ fn schemaColumns(arena: std.mem.Allocator, schema: *const pb.TableSchema) ![]con
 fn tableColumns(arena: std.mem.Allocator, table: *const spec_mod.TableSpec) ![]const Column {
     const out = try arena.alloc(Column, table.columns.len);
     for (table.columns, out) |source, *column| {
-        column.* = .{
-            .name = source.name,
-            .type_name = schema_mod.legacyTypeName(source.type.typeKind()),
-        };
+        column.* = try specColumn(arena, source.name, source.type, source.is_not_null);
     }
     return out;
+}
+
+/// One column from a catalog type: an ARRAY unwraps to its element, marked
+/// REPEATED, and a STRUCT's members come along as schema nodes.
+fn specColumn(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    t: *const spec_mod.Type,
+    required: bool,
+) std.mem.Allocator.Error!Column {
+    const repeated = t.isArray();
+    const elem = if (repeated) (t.element_type orelse t) else t;
+    return .{
+        .name = name,
+        .type_name = schema_mod.legacyTypeName(elem.typeKind()),
+        .mode = if (repeated) "REPEATED" else if (required) "REQUIRED" else "NULLABLE",
+        .fields = if (elem.isStruct()) try specFieldNodes(arena, elem) else &.{},
+    };
+}
+
+/// A STRUCT's members as schema nodes, recursively.
+fn specFieldNodes(
+    arena: std.mem.Allocator,
+    struct_type: *const spec_mod.Type,
+) std.mem.Allocator.Error![]const std.json.Value {
+    const out = try arena.alloc(std.json.Value, struct_type.field_types.len);
+    for (struct_type.field_types, out) |member, *node| {
+        const column = try specColumn(
+            arena,
+            member.name,
+            member.type orelse struct_type,
+            member.is_not_null,
+        );
+        node.* = try columnNode(arena, column);
+    }
+    return out;
+}
+
+/// One column as a schema node. The mode is written only when it is not
+/// NULLABLE, the spelling the REST schema itself uses.
+fn columnNode(arena: std.mem.Allocator, column: Column) !std.json.Value {
+    var object: std.json.ObjectMap = .empty;
+    try object.put(arena, "name", .{ .string = column.name });
+    try object.put(arena, "type", .{ .string = column.type_name });
+    if (!std.mem.eql(u8, column.mode, "NULLABLE")) {
+        try object.put(arena, "mode", .{ .string = column.mode });
+    }
+    if (column.fields.len > 0) {
+        var subs = std.json.Array.init(arena);
+        try subs.appendSlice(column.fields);
+        try object.put(arena, "fields", .{ .array = subs });
+    }
+    return .{ .object = object };
 }
 
 fn detectedColumns(arena: std.mem.Allocator, detection: autodetect.Detection) ![]const Column {
@@ -192,12 +267,7 @@ fn detectedColumns(arena: std.mem.Allocator, detection: autodetect.Detection) ![
 
 fn schemaNodeFrom(arena: std.mem.Allocator, columns: []const Column) !std.json.Value {
     var fields = std.json.Array.init(arena);
-    for (columns) |column| {
-        var object: std.json.ObjectMap = .empty;
-        try object.put(arena, "name", .{ .string = column.name });
-        try object.put(arena, "type", .{ .string = column.type_name });
-        try fields.append(.{ .object = object });
-    }
+    for (columns) |column| try fields.append(try columnNode(arena, column));
     var root: std.json.ObjectMap = .empty;
     try root.put(arena, "fields", .{ .array = fields });
     return .{ .object = root };
@@ -632,6 +702,38 @@ test "newline-delimited JSON takes its columns from the values" {
         try columnTypes(arena, reading),
     );
     try testing.expectEqual(@as(usize, 2), reading.rowCount());
+}
+
+test "a declared RECORD schema reaches the reading with its mode and members" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var n_field = pb.TableFieldSchema{ .name = "n", .type = "INTEGER" };
+    var ts_field = pb.TableFieldSchema{ .name = "ts", .type = "TIMESTAMP" };
+    var members = [_]*pb.TableFieldSchema{ &n_field, &ts_field };
+    var entries_field = pb.TableFieldSchema{
+        .name = "entries",
+        .type = "RECORD",
+        .mode = "REPEATED",
+        .fields = &members,
+    };
+    var id_field = pb.TableFieldSchema{ .name = "id", .type = "INTEGER" };
+    var fields = [_]*pb.TableFieldSchema{ &id_field, &entries_field };
+    const schema = pb.TableSchema{ .fields = &fields };
+
+    const spec = load_handler.LoadSpec{
+        .destination = .{ .project_id = "p", .dataset_id = "d", .table_id = "t" },
+        .source_format = .NEWLINE_DELIMITED_JSON,
+        .schema = &schema,
+    };
+    const reading = try readFrom(arena, "{\"id\":1}\n", spec);
+    const entries = reading.schema_fields[1];
+    try testing.expectEqualStrings("RECORD", entries.object.get("type").?.string);
+    try testing.expectEqualStrings("REPEATED", entries.object.get("mode").?.string);
+    const subs = entries.object.get("fields").?.array.items;
+    try testing.expectEqual(@as(usize, 2), subs.len);
+    try testing.expectEqualStrings("ts", subs[1].object.get("name").?.string);
 }
 
 test "a nested JSON value is refused rather than half read" {
