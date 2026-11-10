@@ -432,7 +432,7 @@ pub const Server = struct {
         };
 
         const job_id = try query_handler.randomId(arena, &s.rng);
-        const int64_ts = q.use_int64_timestamp;
+        const ts_format = q.timestamp_format;
         const res = try query_handler.runQueryFormatted(
             arena,
             s.db,
@@ -440,7 +440,7 @@ pub const Server = struct {
             job_id,
             q.query,
             q.params,
-            int64_ts,
+            ts_format,
         );
         if (!res.ok) {
             return .{ .status = res.status, .body = res.body };
@@ -1279,7 +1279,7 @@ pub const Server = struct {
             .rows = rows,
             .total = @intCast(count.cells[0].int),
             .start = page.start,
-        }, query_handler.int64TimestampFromQuery(arena, req.query));
+        }, query_handler.timestampFormatFromQuery(arena, req.query));
         return .{ .body = out.items };
     }
 
@@ -1969,7 +1969,7 @@ pub const Server = struct {
         // being forced on. Both renderings still land in the stored ResultSet,
         // because the flag that decides between them rides on the later
         // getQueryResults call, long after this request's arena is gone.
-        const int64_ts = query_handler.int64TimestampFromQuery(arena, req.query);
+        const ts_format = query_handler.timestampFormatFromQuery(arena, req.query);
 
         // A query job may carry a destination table: this is how view
         // materialization writes results. Run the DDL form instead of the
@@ -2030,7 +2030,7 @@ pub const Server = struct {
                 job_id,
                 sql,
                 params,
-                int64_ts,
+                ts_format,
             );
         } else try query_handler.runQueryFormatted(
             arena,
@@ -2039,7 +2039,7 @@ pub const Server = struct {
             job_id,
             sql,
             params,
-            int64_ts,
+            ts_format,
         );
         s.slow_queries.record(nowSeed() -| job_t0, sql);
 
@@ -2543,7 +2543,7 @@ pub const Server = struct {
             job_id,
             job.set,
             query_handler.parseResultsPage(arena, req.query),
-            query_handler.int64TimestampFromQuery(arena, req.query),
+            query_handler.timestampFormatFromQuery(arena, req.query),
         );
         return .{ .body = out.items };
     }
