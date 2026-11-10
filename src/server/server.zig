@@ -314,7 +314,7 @@ pub const Server = struct {
             },
             .method_not_allowed => {
                 // A known path with the wrong method is a 405, as
-                // BigQuery does. The message stays as it is.
+                // BigQuery does.
                 return .{
                     .status = .method_not_allowed,
                     .body = try errors.body(
@@ -322,8 +322,8 @@ pub const Server = struct {
                         .method_not_allowed,
                         try std.fmt.allocPrint(
                             arena,
-                            "unexpected request path: {s}",
-                            .{req.path},
+                            "unexpected request method: {s} {s}",
+                            .{ @tagName(req.method), req.path },
                         ),
                     ),
                 };
@@ -3196,7 +3196,7 @@ test "a known path with the wrong method is a 405" {
     const res = try request(s, arena, .DELETE, "/projects/test/queries", "");
     try testing.expectEqual(std.http.Status.method_not_allowed, res.status);
     try testing.expect(std.mem.indexOf(u8, res.body, "methodNotAllowed") != null);
-    try testing.expect(std.mem.indexOf(u8, res.body, "unexpected request path") != null);
+    try testing.expect(std.mem.indexOf(u8, res.body, "unexpected request method: DELETE /projects/test/queries") != null);
 }
 
 test "state persists across requests on the same connection" {
