@@ -3115,6 +3115,53 @@ test "getQueryResults honours formatOptions again, both ways" {
     try testing.expectEqualStrings("1767268800.0", try onlyCell(arena, as_float.body));
 }
 
+test "timestampOutputFormat=ISO8601_STRING renders ISO 8601 on query reads" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    // jobs.query, with the option in the body: 2026-01-01 12:00:00 UTC with
+    // a half-second fraction, kept trimmed in the ISO form.
+    const queried = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT TIMESTAMP '2026-01-01 12:00:00.500000+00' AS ts",
+        \\ "formatOptions":{"timestampOutputFormat":"ISO8601_STRING"}}
+    );
+    try testing.expectEqual(std.http.Status.ok, queried.status);
+    try testing.expectEqualStrings("2026-01-01T12:00:00.5Z", try onlyCell(arena, queried.body));
+
+    // getQueryResults, with the option in the query string, on a job that
+    // was inserted without any format options.
+    const insert = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"query":{"query":
+        \\ "SELECT TIMESTAMP '2026-01-01 12:00:00+00' AS ts","useLegacySql":false}}}
+    );
+    const job_id = try jobIdOf(arena, insert.body);
+    const path = try std.fmt.allocPrint(arena, "/projects/test/queries/{s}", .{job_id});
+    const got = try requestQuery(
+        s,
+        arena,
+        .GET,
+        path,
+        "formatOptions.timestampOutputFormat=ISO8601_STRING&prettyPrint=false",
+        "",
+    );
+    try testing.expectEqualStrings("2026-01-01T12:00:00Z", try onlyCell(arena, got.body));
+
+    // The explicit FLOAT64 enum stands against the legacy flag.
+    const contra = try requestQuery(
+        s,
+        arena,
+        .GET,
+        path,
+        "formatOptions.useInt64Timestamp=true&formatOptions.timestampOutputFormat=FLOAT64&prettyPrint=false",
+        "",
+    );
+    try testing.expectEqualStrings("1767268800.0", try onlyCell(arena, contra.body));
+}
+
 test "maxResults pages through a result, and the token resumes it" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
