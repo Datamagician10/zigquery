@@ -2714,6 +2714,163 @@ test "the /bigquery/v2 prefix reaches the same handler" {
     try testing.expectEqual(std.http.Status.ok, res.status);
 }
 
+/// A table with the stream schema in `dataset`, holding one row.
+fn createNamedTable(
+    s: *Server,
+    arena: std.mem.Allocator,
+    dataset: []const u8,
+    table: []const u8,
+    name: []const u8,
+    age: i64,
+) !void {
+    const create_body = try std.fmt.allocPrint(
+        arena,
+        "{{\"tableReference\":{{\"projectId\":\"test\",\"datasetId\":\"{s}\",\"tableId\":\"{s}\"}},\"schema\":{{\"fields\":[{{\"name\":\"name\",\"type\":\"STRING\"}},{{\"name\":\"age\",\"type\":\"INTEGER\"}}]}}}}",
+        .{ dataset, table },
+    );
+    const created = try request(s, arena, .POST, try std.fmt.allocPrint(
+        arena,
+        "/projects/test/datasets/{s}/tables",
+        .{dataset},
+    ), create_body);
+    try testing.expectEqual(std.http.Status.ok, created.status);
+    const insert_body = try std.fmt.allocPrint(
+        arena,
+        "{{\"rows\":[{{\"json\":{{\"name\":\"{s}\",\"age\":\"{d}\"}}}}]}}",
+        .{ name, age },
+    );
+    const res = try request(s, arena, .POST, try std.fmt.allocPrint(
+        arena,
+        "/projects/test/datasets/{s}/tables/{s}/insertAll",
+        .{ dataset, table },
+    ), insert_body);
+    try testing.expectEqual(std.http.Status.ok, res.status);
+}
+
+/// Two datasets holding a same-named table with a different row in each:
+/// ds1 registers first, so an unqualified name that reads ds2's row proves
+/// the default dataset, not registration order, decided it.
+fn defaultDatasetFixture(s: *Server, arena: std.mem.Allocator) !void {
+    try createNamedTable(s, arena, "ds1", "shared", "one", 1);
+    _ = try request(s, arena, .POST, "/projects/test/datasets",
+        \\{"datasetReference":{"projectId":"test","datasetId":"ds2"}}
+    );
+    try createNamedTable(s, arena, "ds2", "shared", "two", 2);
+    try createNamedTable(s, arena, "ds2", "second", "x", 3);
+}
+
+test "jobs.query reads unqualified names from its defaultDataset" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    try defaultDatasetFixture(s, arena);
+
+    const from_table = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT name FROM shared",
+        \\ "defaultDataset":{"datasetId":"ds2"}}
+    );
+    try testing.expectEqual(std.http.Status.ok, from_table.status);
+    try testing.expectEqualStrings("two", try onlyCell(arena, from_table.body));
+
+    // The unqualified INFORMATION_SCHEMA spelling reads ds2's dataset:
+    // ds1 holds only `shared`, ds2 holds `second` as well.
+    const from_is = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT table_name FROM INFORMATION_SCHEMA.TABLES ORDER BY table_name",
+        \\ "defaultDataset":{"projectId":"test","datasetId":"ds2"}}
+    );
+    try testing.expectEqual(std.http.Status.ok, from_is.status);
+    const names = try cellsOf(arena, from_is.body);
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("second", names[0]);
+    try testing.expectEqualStrings("shared", names[1]);
+
+    // A dataset-qualified spelling ignores the default.
+    const qualified = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT name FROM ds1.shared",
+        \\ "defaultDataset":{"datasetId":"ds2"}}
+    );
+    try testing.expectEqual(std.http.Status.ok, qualified.status);
+    try testing.expectEqualStrings("one", try onlyCell(arena, qualified.body));
+}
+
+test "jobs.query without a defaultDataset refuses an unqualified INFORMATION_SCHEMA view" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    try createStreamTable(s, arena, "t");
+
+    const res = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT table_name FROM INFORMATION_SCHEMA.TABLES"}
+    );
+    try testing.expectEqual(std.http.Status.bad_request, res.status);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        res.body,
+        "INFORMATION_SCHEMA.TABLES",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        res.body,
+        "must be qualified with a dataset",
+    ) != null);
+
+    // SCHEMATA is project-level in BigQuery, so its unqualified spelling is served.
+    const schemata = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT schema_name FROM INFORMATION_SCHEMA.SCHEMATA"}
+    );
+    try testing.expectEqual(std.http.Status.ok, schemata.status);
+}
+
+test "jobs.insert reads unqualified names from its defaultDataset" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    try defaultDatasetFixture(s, arena);
+
+    const inserted = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"query":{"query":"SELECT name FROM shared",
+        \\ "defaultDataset":{"datasetId":"ds2"}}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, inserted.status);
+    const results = try request(
+        s,
+        arena,
+        .GET,
+        try std.fmt.allocPrint(arena, "/projects/test/queries/{s}", .{try jobIdOf(arena, inserted.body)}),
+        "",
+    );
+    try testing.expectEqual(std.http.Status.ok, results.status);
+    try testing.expectEqualStrings("two", try onlyCell(arena, results.body));
+
+    const is_job = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"query":{
+        \\  "query":"SELECT table_name FROM INFORMATION_SCHEMA.TABLES ORDER BY table_name",
+        \\  "defaultDataset":{"projectId":"test","datasetId":"ds2"}}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, is_job.status);
+    const is_results = try request(
+        s,
+        arena,
+        .GET,
+        try std.fmt.allocPrint(arena, "/projects/test/queries/{s}", .{try jobIdOf(arena, is_job.body)}),
+        "",
+    );
+    try testing.expectEqual(std.http.Status.ok, is_results.status);
+    const names = try cellsOf(arena, is_results.body);
+    try testing.expectEqual(@as(usize, 2), names.len);
+    try testing.expectEqualStrings("second", names[0]);
+    try testing.expectEqualStrings("shared", names[1]);
+}
+
 // ---- query parameters ----
 //
 // The REST `queryParameters` field was parsed and silently dropped before
