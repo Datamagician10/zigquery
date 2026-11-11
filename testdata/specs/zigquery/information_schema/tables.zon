@@ -1,0 +1,28 @@
+.{
+    .spec = "zigquery/information_schema/tables",
+    .dialect = .zigquery,
+    .cases = .{
+        .{
+            // Measured against real BigQuery (recidiviz-bigquery-sandbox,
+            // 2026-10-01): with no default dataset, the unqualified spelling
+            // is refused; a job's defaultDataset is what qualifies it.
+            .desc = "an unqualified INFORMATION_SCHEMA.TABLES with no default dataset is refused",
+            .setup = .{
+                "CREATE TABLE unqualified_is_ds.t (a INT64)",
+            },
+            .sql = "SELECT table_name FROM INFORMATION_SCHEMA.TABLES",
+            .expect_error = "Table \"INFORMATION_SCHEMA.TABLES\" must be qualified with a dataset (e.g. dataset.table).",
+            .rows = .{},
+        },
+        .{
+            .desc = "SCHEMATA is project-level, so the unqualified spelling is served",
+            .setup = .{
+                "CREATE TABLE unqualified_is_ds.t (a INT64)",
+            },
+            .sql = "SELECT schema_name FROM INFORMATION_SCHEMA.SCHEMATA WHERE schema_name = 'unqualified_is_ds'",
+            .rows = .{
+                .{"unqualified_is_ds"},
+            },
+        },
+    },
+}

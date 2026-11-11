@@ -309,6 +309,14 @@ pub const StatementOutcome = struct {
     dml: ?DmlCounts = null,
 };
 
+/// A job's default dataset: the project may be absent for a dataset the
+/// engine registered without one (`ds.t`), in which case the dataset's
+/// name path is the single segment.
+pub const DefaultDataset = struct {
+    project_id: ?[]const u8 = null,
+    dataset_id: []const u8,
+};
+
 pub const Db = struct {
     gpa: std.mem.Allocator,
     sqlite_db: sqlite.Db,
@@ -335,6 +343,18 @@ pub const Db = struct {
     /// server sets one. BigQuery resolves such names against the job's
     /// project; without a default the path is registered as written.
     default_project: ?[]const u8 = null,
+    /// The dataset a job's unqualified names belong to, when a server sets
+    /// one from the request's `defaultDataset`. BigQuery resolves a bare
+    /// table name and an unqualified `INFORMATION_SCHEMA.<view>` against it.
+    /// Catalog renders give this dataset's objects the unqualified names;
+    /// without one, an unqualified INFORMATION_SCHEMA spelling is refused
+    /// before analysis, as BigQuery refuses it.
+    default_dataset: ?DefaultDataset = null,
+    /// The default dataset the analyzer catalog handle currently reflects,
+    /// as a canonical `project_dataset` (or bare `dataset`) name. The handle
+    /// is rebuilt when this disagrees with `default_dataset`, because which
+    /// dataset holds the unqualified names is baked into a render.
+    catalog_default_key: ?[]u8 = null,
     /// Whether a CREATE into `project.dataset.x` must name a dataset the
     /// catalog holds, as BigQuery insists ("Not found: Dataset p:ds was not
     /// found in location US"). Off by default: the engine library and the
@@ -440,6 +460,7 @@ pub const Db = struct {
 
     pub fn close(db: *Db) void {
         if (db.catalog_handle) |h| analyzer_ffi.catalogDestroy(h);
+        if (db.catalog_default_key) |k| db.gpa.free(k);
         db.clearLastError();
         // Before sqlite_db.close(): sqlite3_close_v2 leaves the handle a
         // zombie until every statement is finalized.
@@ -1016,6 +1037,28 @@ pub const Db = struct {
         return g.catalog.deleteFunctionSpec(&db.sqlite_db, name);
     }
 
+    /// `default_dataset` as a name path in `arena`, or null when the
+    /// connection has no default dataset.
+    fn defaultDatasetPath(
+        db: *Db,
+        arena: std.mem.Allocator,
+    ) error{OutOfMemory}!?[]const []const u8 {
+        const dd = db.default_dataset orelse return null;
+        if (dd.project_id) |p| return try arena.dupe([]const u8, &.{ p, dd.dataset_id });
+        return try arena.dupe([]const u8, &.{dd.dataset_id});
+    }
+
+    /// `default_dataset` as a canonical name, for comparing against what a
+    /// catalog handle was rendered with. Arena-owned; null as `defaultDatasetPath`.
+    fn defaultDatasetKey(
+        db: *Db,
+        arena: std.mem.Allocator,
+    ) error{OutOfMemory}!?[]const u8 {
+        const dd = db.default_dataset orelse return null;
+        if (dd.project_id) |p| return try std.mem.join(arena, "_", &.{ p, dd.dataset_id });
+        return dd.dataset_id;
+    }
+
     /// The whole catalog as one proto, for the stateless analyzer path.
     fn statelessCatalogJson(
         db: *Db,
@@ -1023,7 +1066,7 @@ pub const Db = struct {
     ) error{ OutOfMemory, InvalidSpec }![:0]u8 {
         var g = db.lockCatalog();
         defer g.unlock();
-        return g.catalog.catalogJsonWith(arena, db.temps);
+        return g.catalog.catalogJsonWith(arena, db.temps, try db.defaultDatasetPath(arena));
     }
 
     fn addPersistentFunctionSpec(db: *Db, fs: *const spec.FunctionSpec) catalog_mod.Error!void {
@@ -1258,6 +1301,21 @@ pub const Db = struct {
     ) ?*analyzer_ffi.CatalogHandle {
         if (db.catalog_handle == null) return null;
 
+        // A render bakes in which dataset holds the unqualified names, so a
+        // handle synced under a different default dataset than the current
+        // one is rebuilt from scratch, the same recovery as a failed apply.
+        const default_key = db.defaultDatasetKey(arena) catch return null;
+        const key_changed = !std.mem.eql(
+            u8,
+            db.catalog_default_key orelse "",
+            default_key orelse "",
+        );
+        if (key_changed) {
+            db.cursor.needs_rebuild = true;
+            db.temp_cursor.needs_rebuild = true;
+        }
+        const default_path = db.defaultDatasetPath(arena) catch return null;
+
         // Both sources are rendered before either is applied, because a full
         // render assumes a fresh handle: if one side rendered from scratch and
         // the other incrementally, recreating the handle would silently drop
@@ -1270,12 +1328,12 @@ pub const Db = struct {
             const persistent = blk: {
                 var g = db.lockCatalog();
                 defer g.unlock();
-                break :blk g.catalog.renderDelta(arena, &db.cursor) catch {
+                break :blk g.catalog.renderDelta(arena, &db.cursor, default_path) catch {
                     db.cursor.needs_rebuild = true;
                     return null;
                 };
             };
-            const temps = db.temps.renderDelta(arena, &db.temp_cursor) catch {
+            const temps = db.temps.renderDelta(arena, &db.temp_cursor, default_path) catch {
                 db.temp_cursor.needs_rebuild = true;
                 return null;
             };
@@ -1297,6 +1355,13 @@ pub const Db = struct {
             // addition, so applying them after the persistent ones is what
             // makes a TEMP object shadow the persistent one it overrides.
             if (!db.applyOps(temps.ops, &db.temp_cursor)) return null;
+            if (key_changed) {
+                if (db.catalog_default_key) |k| db.gpa.free(k);
+                db.catalog_default_key = if (default_key) |k|
+                    db.gpa.dupe(u8, k) catch null
+                else
+                    null;
+            }
             return db.catalog_handle;
         }
         return null;
@@ -1353,6 +1418,21 @@ pub const Db = struct {
     ) Error!analyzer_ffi.Analyzed {
         var analyze_timer = phase.Timer.begin(.analyze);
         defer analyze_timer.end();
+        // BigQuery refuses an unqualified `INFORMATION_SCHEMA.<view>` when a
+        // job has no default dataset; the analyzer cannot, because the
+        // spelling is registered as a suffix of every dataset's views.
+        if (db.default_dataset == null) {
+            if (unqualifiedInfoSchemaView(sqlz[offset..])) |view| {
+                const msg = std.fmt.allocPrint(
+                    arena,
+                    "Table \"INFORMATION_SCHEMA.{s}\" must be qualified with a dataset " ++
+                        "(e.g. dataset.table).",
+                    .{view},
+                ) catch return error.OutOfMemory;
+                db.setLastError(msg);
+                return error.AnalyzeFailed;
+            }
+        }
         // Re-read the handle from `db` *after* syncing: a catalog removal
         // forces a rebuild, which destroys the old handle. Using the pointer
         // captured before the sync is a use-after-free.
@@ -2562,7 +2642,11 @@ pub const Db = struct {
             const catalog_json = render: {
                 var g = db.lockCatalog();
                 defer g.unlock();
-                break :render g.catalog.catalogJson(arena);
+                break :render g.catalog.catalogJsonWith(
+                    arena,
+                    null,
+                    try db.defaultDatasetPath(arena),
+                );
             };
             break :blk try db.analyzeWithCatalogJson(arena, sql, 0, catalog_json, "{}", null);
         };
@@ -3385,6 +3469,155 @@ fn scriptOutcome(last: StatementOutcome, statement_count: u32) StatementOutcome 
 }
 
 /// Splits every path segment on ".", since a backticked identifier may carry dots.
+/// The view named by an unqualified `INFORMATION_SCHEMA.<view>` spelling in
+/// the first statement of `sql`, or null. SCHEMATA is exempt: it is a
+/// project-level view, and BigQuery serves the unqualified spelling from the
+/// job's project. Strings, comments and quoted identifiers are skipped, a
+/// spelling preceded by another path segment (`ds.INFORMATION_SCHEMA.…`) is
+/// qualified, and the scan stops at the statement's end.
+fn unqualifiedInfoSchemaView(sql: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    // The previous significant token was a `.`, so an identifier here
+    // continues a longer name path rather than starting one.
+    var prev_dot = false;
+    while (i < sql.len) {
+        const ch = sql[i];
+        if (std.ascii.isWhitespace(ch)) {
+            i += 1;
+            continue;
+        }
+        if (skipComment(sql, i)) |end| {
+            i = end;
+            continue;
+        }
+        if (ch == ';') break;
+        if (ch == '.') {
+            prev_dot = true;
+            i += 1;
+            continue;
+        }
+        if (ch == '\'' or ch == '"') {
+            i = skipQuoted(sql, i);
+            prev_dot = false;
+            continue;
+        }
+        if (ch == '`') {
+            const end = std.mem.indexOfScalarPos(u8, sql, i + 1, '`') orelse sql.len;
+            if (!prev_dot) {
+                if (backquotedInfoSchemaView(sql[i + 1 .. end])) |view| return view;
+            }
+            i = if (end < sql.len) end + 1 else end;
+            prev_dot = false;
+            continue;
+        }
+        if (std.ascii.isAlphabetic(ch) or ch == '_') {
+            const start = i;
+            while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) i += 1;
+            const word = sql[start..i];
+            // A raw/bytes string's prefix letter is part of the literal.
+            if (word.len == 1 and i < sql.len and (sql[i] == '\'' or sql[i] == '"') and
+                (word[0] == 'r' or word[0] == 'R' or word[0] == 'b' or word[0] == 'B'))
+            {
+                i = skipQuoted(sql, i);
+                prev_dot = false;
+                continue;
+            }
+            if (!prev_dot and std.ascii.eqlIgnoreCase(word, "INFORMATION_SCHEMA")) {
+                var j = skipSpaceAndComments(sql, i);
+                if (j < sql.len and sql[j] == '.') {
+                    j = skipSpaceAndComments(sql, j + 1);
+                    if (readPathSegment(sql, j)) |seg| {
+                        if (!std.ascii.eqlIgnoreCase(seg.text, "SCHEMATA")) return seg.text;
+                    }
+                }
+            }
+            prev_dot = false;
+            continue;
+        }
+        prev_dot = false;
+        i += 1;
+    }
+    return null;
+}
+
+/// The view in a backquoted two-segment `INFORMATION_SCHEMA.<view>` name, or
+/// null for any other backquoted name.
+fn backquotedInfoSchemaView(content: []const u8) ?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, content, '.') orelse return null;
+    if (std.mem.indexOfScalarPos(u8, content, dot + 1, '.') != null) return null;
+    if (!std.ascii.eqlIgnoreCase(content[0..dot], "INFORMATION_SCHEMA")) return null;
+    const view = content[dot + 1 ..];
+    if (view.len == 0 or std.ascii.eqlIgnoreCase(view, "SCHEMATA")) return null;
+    return view;
+}
+
+/// One dotted-path segment at `start`: a bare or backquoted identifier.
+fn readPathSegment(sql: []const u8, start: usize) ?struct { text: []const u8 } {
+    if (start >= sql.len) return null;
+    if (sql[start] == '`') {
+        const end = std.mem.indexOfScalarPos(u8, sql, start + 1, '`') orelse return null;
+        return .{ .text = sql[start + 1 .. end] };
+    }
+    if (!std.ascii.isAlphabetic(sql[start]) and sql[start] != '_') return null;
+    var i = start;
+    while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_')) i += 1;
+    return .{ .text = sql[start..i] };
+}
+
+/// The end of the comment starting at `i`, or null when `sql[i]` opens none.
+fn skipComment(sql: []const u8, i: usize) ?usize {
+    if (sql[i] == '#' or (sql[i] == '-' and i + 1 < sql.len and sql[i + 1] == '-')) {
+        return std.mem.indexOfScalarPos(u8, sql, i, '\n') orelse sql.len;
+    }
+    if (sql[i] == '/' and i + 1 < sql.len and sql[i + 1] == '*') {
+        const end = std.mem.indexOfPos(u8, sql, i + 2, "*/") orelse return sql.len;
+        return end + 2;
+    }
+    return null;
+}
+
+fn skipSpaceAndComments(sql: []const u8, start: usize) usize {
+    var i = start;
+    while (i < sql.len) {
+        if (std.ascii.isWhitespace(sql[i])) {
+            i += 1;
+            continue;
+        }
+        if (skipComment(sql, i)) |end| {
+            i = end;
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+/// The index just past the quoted literal opening at `sql[i]` (a `'` or `"`
+/// quote): triple-quoted forms, backslash escapes and doubled quotes.
+fn skipQuoted(sql: []const u8, i: usize) usize {
+    const q = sql[i];
+    if (i + 2 < sql.len and sql[i + 1] == q and sql[i + 2] == q) {
+        const end = std.mem.indexOfPos(u8, sql, i + 3, &.{ q, q, q }) orelse return sql.len;
+        return end + 3;
+    }
+    var j = i + 1;
+    while (j < sql.len) {
+        if (sql[j] == '\\') {
+            j += 2;
+            continue;
+        }
+        if (sql[j] == q) {
+            if (j + 1 < sql.len and sql[j + 1] == q) {
+                j += 2;
+                continue;
+            }
+            return j + 1;
+        }
+        j += 1;
+    }
+    return sql.len;
+}
+
 fn normalizePath(
     arena: std.mem.Allocator,
     path: []const []const u8,
@@ -4785,6 +5018,91 @@ test "INFORMATION_SCHEMA.TABLES lists the dataset's tables and views" {
         try testing.expectEqualStrings(want[i].kind, row[1].string);
     }
     try testing.expectEqual(want.len, i);
+}
+
+test "a default dataset resolves unqualified table and INFORMATION_SCHEMA names" {
+    var db = try Db.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE dd_a.t (x INT64)", &.{}, .{});
+    try db.exec("INSERT INTO dd_a.t VALUES (1)", &.{}, .{});
+    try db.exec("CREATE TABLE dd_b.t (x INT64)", &.{}, .{});
+    try db.exec("INSERT INTO dd_b.t VALUES (2)", &.{}, .{});
+
+    db.default_dataset = .{ .dataset_id = "dd_b" };
+
+    // The bare table name is dd_b's table, not the first one registered.
+    var rows = try db.query("SELECT x FROM t", &.{}, .{});
+    defer rows.deinit();
+    try testing.expectEqual(Cell{ .int = 2 }, (try rows.next()).?[0]);
+    try testing.expectEqual(@as(?[]const Cell, null), try rows.next());
+
+    // The unqualified INFORMATION_SCHEMA spelling reads dd_b's views.
+    var views = try db.query("SELECT table_name FROM INFORMATION_SCHEMA.TABLES", &.{}, .{});
+    defer views.deinit();
+    try testing.expectEqualStrings("t", (try views.next()).?[0].string);
+    try testing.expectEqual(@as(?[]const Cell, null), try views.next());
+
+    // Clearing the default restores the first-registered table.
+    db.default_dataset = null;
+    var plain = try db.query("SELECT x FROM t", &.{}, .{});
+    defer plain.deinit();
+    try testing.expectEqual(Cell{ .int = 1 }, (try plain.next()).?[0]);
+}
+
+test "an unqualified INFORMATION_SCHEMA view with no default dataset is refused" {
+    var db = try Db.open(testing.allocator, ":memory:");
+    defer db.close();
+
+    try db.exec("CREATE TABLE nd.t (x INT64)", &.{}, .{});
+
+    try testing.expectError(
+        error.AnalyzeFailed,
+        db.query("SELECT table_name FROM INFORMATION_SCHEMA.TABLES", &.{}, .{}),
+    );
+    try testing.expectEqualStrings(
+        "Table \"INFORMATION_SCHEMA.TABLES\" must be qualified with a dataset " ++
+            "(e.g. dataset.table).",
+        db.lastError(),
+    );
+    // The spelling inside a string, and the qualified spelling, are untouched.
+    var rows = try db.query(
+        "SELECT 'FROM INFORMATION_SCHEMA.TABLES' AS s",
+        &.{},
+        .{},
+    );
+    defer rows.deinit();
+    _ = try rows.next();
+    var qualified = try db.query(
+        "SELECT table_name FROM nd.INFORMATION_SCHEMA.TABLES",
+        &.{},
+        .{},
+    );
+    defer qualified.deinit();
+    try testing.expectEqualStrings("t", (try qualified.next()).?[0].string);
+}
+
+test "unqualifiedInfoSchemaView finds only the unqualified dataset-level spelling" {
+    const cases = [_]struct { sql: []const u8, view: ?[]const u8 }{
+        .{ .sql = "SELECT * FROM INFORMATION_SCHEMA.TABLES", .view = "TABLES" },
+        .{ .sql = "select * from information_schema.columns", .view = "columns" },
+        .{ .sql = "SELECT * FROM `INFORMATION_SCHEMA.TABLE_OPTIONS`", .view = "TABLE_OPTIONS" },
+        .{ .sql = "SELECT * FROM ds.INFORMATION_SCHEMA.TABLES", .view = null },
+        .{ .sql = "SELECT * FROM `p.ds`.INFORMATION_SCHEMA.TABLES", .view = null },
+        .{ .sql = "SELECT * FROM `p`.INFORMATION_SCHEMA.TABLES", .view = null },
+        .{ .sql = "SELECT * FROM INFORMATION_SCHEMA.SCHEMATA", .view = null },
+        .{ .sql = "SELECT 'INFORMATION_SCHEMA.TABLES'", .view = null },
+        .{ .sql = "SELECT 1 -- FROM INFORMATION_SCHEMA.TABLES\n", .view = null },
+        .{ .sql = "SELECT 1; SELECT * FROM INFORMATION_SCHEMA.TABLES", .view = null },
+    };
+    for (cases) |c| {
+        const got = unqualifiedInfoSchemaView(c.sql);
+        if (c.view) |want| {
+            try testing.expectEqualStrings(want, got.?);
+        } else {
+            try testing.expectEqual(@as(?[]const u8, null), got);
+        }
+    }
 }
 
 test "INFORMATION_SCHEMA.COLUMNS reports columns in declaration order" {

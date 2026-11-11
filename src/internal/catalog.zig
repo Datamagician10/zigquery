@@ -231,11 +231,14 @@ pub const Catalog = struct {
         c: *const Catalog,
         alloc: std.mem.Allocator,
         cur: *Cursor,
+        /// The default dataset's name path, when the connection has one:
+        /// its objects take the unqualified names in this render.
+        default_path: ?[]const []const u8,
     ) error{ OutOfMemory, InvalidSpec }!Delta {
         var ops: std.ArrayList(DeltaOp) = .empty;
 
         if (c.needsRebuild(cur.*)) {
-            try ops.append(alloc, .{ .add_json = try c.catalogJson(alloc) });
+            try ops.append(alloc, .{ .add_json = try c.catalogJsonWith(alloc, null, default_path) });
             c.advance(cur);
             return .{ .ops = ops.items, .full = true };
         }
@@ -249,11 +252,11 @@ pub const Catalog = struct {
                 if (c.tableSpecByName(name)) |s| try pending.append(alloc, s);
             },
             .table_removed => |name| {
-                try flushAdditions(c, alloc, &ops, &pending);
+                try flushAdditions(c, alloc, &ops, &pending, default_path);
                 try ops.append(alloc, .{ .remove = try alloc.dupeSentinel(u8, name, 0) });
             },
         };
-        try flushAdditions(c, alloc, &ops, &pending);
+        try flushAdditions(c, alloc, &ops, &pending, default_path);
 
         if (cur.functions_seen != c.functions.items.len) {
             try ops.append(alloc, .{
@@ -270,10 +273,11 @@ pub const Catalog = struct {
         alloc: std.mem.Allocator,
         ops: *std.ArrayList(DeltaOp),
         pending: *std.ArrayList(*spec.TableSpec),
+        default_path: ?[]const []const u8,
     ) error{ OutOfMemory, InvalidSpec }!void {
         if (pending.items.len == 0) return;
         try ops.append(alloc, .{
-            .add_json = try c.catalogJsonForSpecs(alloc, pending.items),
+            .add_json = try c.catalogJsonForSpecs(alloc, pending.items, default_path),
         });
         pending.* = .empty;
     }
@@ -310,13 +314,20 @@ pub const Catalog = struct {
         c: *const Catalog,
         alloc: std.mem.Allocator,
         specs: []const *spec.TableSpec,
+        /// The default dataset's name path, when the connection has one:
+        /// its objects are rendered first, so they take the unqualified
+        /// names (registration is first-wins).
+        default_path: ?[]const []const u8,
     ) error{ OutOfMemory, InvalidSpec }![:0]u8 {
         _ = c;
         if (specs.len == 0) return alloc.dupeSentinel(u8, "{}", 0);
         var root = Node{ .name = catalog_name };
-        for (specs) |table_spec| {
-            const canonical = try table_spec.tableName(alloc);
-            try addTableToNode(alloc, &root, table_spec.name_path, table_spec, canonical);
+        for ([_]bool{ true, false }) |want_default| {
+            for (specs) |table_spec| {
+                if (inDefaultDataset(table_spec.name_path, default_path) != want_default) continue;
+                const canonical = try table_spec.tableName(alloc);
+                try addTableToNode(alloc, &root, table_spec.name_path, table_spec, canonical);
+            }
         }
         return renderNode(alloc, &root);
     }
@@ -1123,17 +1134,24 @@ pub const Catalog = struct {
         c: *const Catalog,
         alloc: std.mem.Allocator,
     ) error{ OutOfMemory, InvalidSpec }![:0]u8 {
-        return c.catalogJsonWith(alloc, null);
+        return c.catalogJsonWith(alloc, null, null);
     }
 
     /// Renders this catalog unioned with a per-connection TEMP overlay, the
     /// overlay winning on name collisions. Used by the stateless analyzer
     /// path, which rebuilds the whole proto per statement instead of pushing
     /// deltas into a persistent handle.
+    ///
+    /// `default_path` is the default dataset's name path, when the
+    /// connection has one: its objects render first, and registration is
+    /// first-wins, so the unqualified names (a bare table name, the
+    /// `INFORMATION_SCHEMA.<view>` spelling) resolve to that dataset, as
+    /// BigQuery resolves them against a job's default dataset.
     pub fn catalogJsonWith(
         c: *const Catalog,
         alloc: std.mem.Allocator,
         overlay: ?*const Catalog,
+        default_path: ?[]const []const u8,
     ) error{ OutOfMemory, InvalidSpec }![:0]u8 {
         const ov_tables = if (overlay) |o| o.table_map.count() else 0;
         const ov_funcs = if (overlay) |o| o.functions.items.len else 0;
@@ -1142,12 +1160,15 @@ pub const Catalog = struct {
             return alloc.dupeSentinel(u8, "{}", 0);
 
         var root = Node{ .name = catalog_name };
-        for (c.tables.items) |maybe| {
-            const table_spec = maybe orelse continue;
-            const canonical = try table_spec.tableName(alloc);
-            // Shadowed by the overlay: emit the overlay's definition only.
-            if (overlay) |o| if (o.table_map.contains(canonical)) continue;
-            try addTableToNode(alloc, &root, table_spec.name_path, table_spec, canonical);
+        for ([_]bool{ true, false }) |want_default| {
+            for (c.tables.items) |maybe| {
+                const table_spec = maybe orelse continue;
+                if (inDefaultDataset(table_spec.name_path, default_path) != want_default) continue;
+                const canonical = try table_spec.tableName(alloc);
+                // Shadowed by the overlay: emit the overlay's definition only.
+                if (overlay) |o| if (o.table_map.contains(canonical)) continue;
+                try addTableToNode(alloc, &root, table_spec.name_path, table_spec, canonical);
+            }
         }
         // Functions register under their leaf name at the root and inside every sub-catalog along
         // the path.
@@ -1156,10 +1177,14 @@ pub const Catalog = struct {
             try addFunctionToNode(alloc, &root, fs.name_path, fs);
         }
         if (overlay) |o| {
-            for (o.tables.items) |maybe| {
-                const table_spec = maybe orelse continue;
-                const canonical = try table_spec.tableName(alloc);
-                try addTableToNode(alloc, &root, table_spec.name_path, table_spec, canonical);
+            for ([_]bool{ true, false }) |want_default| {
+                for (o.tables.items) |maybe| {
+                    const table_spec = maybe orelse continue;
+                    if (inDefaultDataset(table_spec.name_path, default_path) != want_default)
+                        continue;
+                    const canonical = try table_spec.tableName(alloc);
+                    try addTableToNode(alloc, &root, table_spec.name_path, table_spec, canonical);
+                }
             }
             for (o.functions.items) |fs| {
                 try addFunctionToNode(alloc, &root, fs.name_path, fs);
@@ -1267,6 +1292,18 @@ const Node = struct {
         try n.fn_entry_set.put(alloc, e.registered, {});
     }
 };
+
+/// Whether `name_path` names an object inside the dataset `default_path`
+/// prefixes: a table in it, or one of its INFORMATION_SCHEMA views. A null
+/// default matches nothing.
+fn inDefaultDataset(name_path: []const []const u8, default_path: ?[]const []const u8) bool {
+    const prefix = default_path orelse return false;
+    if (name_path.len <= prefix.len) return false;
+    for (prefix, name_path[0..prefix.len]) |want, got| {
+        if (!std.mem.eql(u8, want, got)) return false;
+    }
+    return true;
+}
 
 /// For a path [a, b, c], registers "a.b.c", "b.c" and "c" at the current level, plus
 /// sub-catalogs a -> {"b.c", "c", b -> {"c"}}. The first registration of a name wins.
@@ -1978,6 +2015,53 @@ test "catalogJson: analyzer resolves bare and dotted table names" {
     const fresh_json = try fresh.catalogJson(alloc);
     try testing.expect(std.mem.indexOf(u8, fresh_json, "\"customFunction\"") != null);
     try testing.expect(std.mem.indexOf(u8, fresh_json, "contains_substr") != null);
+}
+
+test "catalogJsonWith: a default dataset takes the unqualified names" {
+    var db = try sqlite.Db.open(":memory:");
+    defer db.close();
+
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    var c = try Catalog.init(testing.allocator);
+    defer c.deinit();
+    try c.createCatalogTablesIfNotExist(&db);
+    // ds_a registers first, so without a default its table takes the bare name.
+    try c.addNewTableSpec(&db, try testTableSpec(alloc, &.{ "proj", "ds_a", "t" }));
+    try c.addNewTableSpec(&db, try testTableSpec(alloc, &.{ "proj", "ds_b", "t" }));
+
+    const plain_json = try c.catalogJson(alloc);
+    {
+        const analyzed = try analyzer_ffi.analyzeNextStatement(alloc, "SELECT a FROM t", 0, plain_json);
+        try testing.expectEqualStrings("proj_ds_a_t", try resolvedTableName(analyzed.node));
+    }
+
+    // With ds_b as the default, the bare name and the unqualified
+    // INFORMATION_SCHEMA spelling resolve to ds_b instead.
+    const default_json = try c.catalogJsonWith(alloc, null, &.{ "proj", "ds_b" });
+    {
+        const analyzed = try analyzer_ffi.analyzeNextStatement(alloc, "SELECT a FROM t", 0, default_json);
+        try testing.expectEqualStrings("proj_ds_b_t", try resolvedTableName(analyzed.node));
+    }
+    {
+        const analyzed = try analyzer_ffi.analyzeNextStatement(
+            alloc,
+            "SELECT table_name FROM INFORMATION_SCHEMA.TABLES",
+            0,
+            default_json,
+        );
+        try testing.expectEqualStrings(
+            "proj_ds_b_INFORMATION_SCHEMA_TABLES",
+            try resolvedTableName(analyzed.node),
+        );
+    }
+    // A dataset-qualified spelling is unaffected by the default.
+    {
+        const analyzed = try analyzer_ffi.analyzeNextStatement(alloc, "SELECT a FROM ds_a.t", 0, default_json);
+        try testing.expectEqualStrings("proj_ds_a_t", try resolvedTableName(analyzed.node));
+    }
 }
 
 test "catalogJson: seeded MISSING_FUNCTIONS resolve through the analyzer" {

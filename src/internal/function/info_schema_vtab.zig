@@ -27,12 +27,14 @@
 //! pool. The driver publishes `State.info_schema` before preparing; an empty
 //! snapshot yields zero rows, which is also what should happen during close.
 //!
-//! ## Known limitation
+//! ## Unqualified spellings
 //!
 //! `catalog.addTableToNode` registers every path suffix including the bare
-//! leaf, first-wins, so an unqualified `FROM INFORMATION_SCHEMA.TABLES`
-//! resolves to whichever dataset registered first. BigQuery reads that spelling
-//! as "the default dataset"; the engine has no such concept.
+//! leaf, first-wins. A connection with a default dataset renders its
+//! dataset's objects first, so an unqualified `FROM INFORMATION_SCHEMA.TABLES`
+//! and a bare table name resolve there, as BigQuery resolves them against a
+//! job's default dataset. With no default dataset, the driver refuses the
+//! unqualified INFORMATION_SCHEMA spelling before analysis.
 // ephor:ignore-file ZA303 ZA304
 
 const std = @import("std");
