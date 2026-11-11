@@ -47,7 +47,32 @@ pub const QueryRequest = struct {
     /// with the query-string form (handler.go:2420-2424); the other two
     /// endpoints read only the query string.
     use_int64_timestamp: bool = false,
+    /// `defaultDataset` from the body, when it names a dataset.
+    default_dataset: ?DefaultDataset = null,
 };
+
+/// A request's `defaultDataset`. The project may be absent, in which case
+/// the job's project supplies it (rest/v2/DatasetReference).
+pub const DefaultDataset = struct {
+    project_id: ?[]const u8 = null,
+    dataset_id: []const u8,
+
+    /// This default with the job's project filled in, as the driver wants it.
+    pub fn resolve(self: DefaultDataset, job_project: []const u8) driver.DefaultDataset {
+        return .{
+            .project_id = self.project_id orelse job_project,
+            .dataset_id = self.dataset_id,
+        };
+    }
+};
+
+/// A decoded `DatasetReference` as a `DefaultDataset`, or null when it
+/// names no dataset.
+pub fn defaultDatasetOf(ref: ?*const pb.DatasetReference) ?DefaultDataset {
+    const r = ref orelse return null;
+    const dataset_id = r.dataset_id orelse return null;
+    return .{ .project_id = r.project_id, .dataset_id = dataset_id };
+}
 
 /// Reads a jobs.query request: the body, the query string, and the project id
 /// the path bound.
@@ -82,6 +107,7 @@ pub fn parseRequest(
     // it is read on its own.
     req.use_int64_timestamp = int64Timestamp(q.format_options) or
         int64TimestampFromQuery(arena, query);
+    req.default_dataset = defaultDatasetOf(q.default_dataset);
     req.params = try queryparam.parseTyped(arena, q.query_parameters);
     return req;
 }
@@ -707,6 +733,32 @@ test "queryParameters reach the request" {
     try testing.expectEqual(@as(usize, 1), req.params.len);
     try testing.expectEqualStrings("a", req.params[0].name.?);
     try testing.expectEqualStrings("x", req.params[0].value.string);
+}
+
+test "defaultDataset reaches the request, with its project when it names one" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const with_project = try parseRequest(arena,
+        \\{"query":"SELECT 1","defaultDataset":{"projectId":"p","datasetId":"ds"}}
+    , "");
+    try testing.expectEqualStrings("ds", with_project.default_dataset.?.dataset_id);
+    try testing.expectEqualStrings("p", with_project.default_dataset.?.project_id.?);
+    // A reference without a project resolves against the job's.
+    const resolved = with_project.default_dataset.?.resolve("jobp");
+    try testing.expectEqualStrings("p", resolved.project_id.?);
+
+    const bare = try parseRequest(arena,
+        \\{"query":"SELECT 1","defaultDataset":{"datasetId":"ds"}}
+    , "");
+    try testing.expectEqual(@as(?[]const u8, null), bare.default_dataset.?.project_id);
+    try testing.expectEqualStrings("jobp", bare.default_dataset.?.resolve("jobp").project_id.?);
+
+    const none = try parseRequest(arena,
+        \\{"query":"SELECT 1"}
+    , "");
+    try testing.expectEqual(@as(?DefaultDataset, null), none.default_dataset);
 }
 
 test "a body with no queryParameters has none" {

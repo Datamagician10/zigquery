@@ -430,6 +430,9 @@ pub const Server = struct {
             => return badRequest(arena, "invalid query parameter"),
             error.InvalidRequest => return badRequest(arena, "query is required"),
         };
+        // The request's defaultDataset qualifies the job's unqualified names.
+        if (q.default_dataset) |dd| s.db.default_dataset = dd.resolve(project_id);
+        defer s.db.default_dataset = null;
 
         const job_id = try query_handler.randomId(arena, &s.rng);
         const int64_ts = q.use_int64_timestamp;
@@ -1953,6 +1956,11 @@ pub const Server = struct {
         const sql = jobs_handler.queryFromJobConfig(job) orelse {
             return badRequest(arena, "configuration.query.query is required");
         };
+        // The job's defaultDataset qualifies its unqualified names.
+        if (jobs_handler.defaultDatasetFromJobConfig(job)) |dd| {
+            s.db.default_dataset = dd.resolve(project_id);
+        }
+        defer s.db.default_dataset = null;
         const params = jobs_handler.parametersFromJobConfig(arena, job) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.InvalidParameter,

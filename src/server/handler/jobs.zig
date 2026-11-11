@@ -18,6 +18,7 @@ const zigquery = @import("zigquery");
 const driver = zigquery.driver;
 const job_rows_vtab = zigquery.function.job_rows_vtab;
 const queryparam = @import("../internal/types/queryparam.zig");
+const query_handler = @import("query.zig");
 const json_pb = @import("../json_pb.zig");
 const pb = @import("../proto/bigquery.zig");
 const response = @import("../internal/types/response.zig");
@@ -41,6 +42,12 @@ fn queryConfig(job: *const pb.Job) ?*const pb.JobConfigurationQuery {
 pub fn queryFromJobConfig(job: *const pb.Job) ?[]const u8 {
     const q = queryConfig(job) orelse return null;
     return q.query;
+}
+
+/// `configuration.query.defaultDataset`, when it names a dataset.
+pub fn defaultDatasetFromJobConfig(job: *const pb.Job) ?query_handler.DefaultDataset {
+    const q = queryConfig(job) orelse return null;
+    return query_handler.defaultDatasetOf(q.default_dataset);
 }
 
 /// `configuration.query.queryParameters`, reshaped for the driver.
