@@ -35,6 +35,8 @@ const jobs_handler = @import("handler/jobs.zig");
 const copy_handler = @import("handler/jobs.copy.zig");
 const pb = @import("proto/bigquery.zig");
 const upload = @import("upload.zig");
+const read_service = @import("grpc/read_service.zig");
+const gcs = @import("gcs.zig");
 const load_handler = @import("handler/jobs.load.zig");
 const load_rows = @import("internal/load_rows.zig");
 const datasets_handler = @import("handler/datasets.zig");
@@ -114,6 +116,9 @@ pub const Options = struct {
     data_from_json: []const []const u8 = &.{},
     /// Go's --dataset: one empty dataset created at startup.
     dataset: ?[]const u8 = null,
+    /// Where load jobs read gs:// sources:
+    /// A Cloud Storage emulator's `host:port` or `http://host:port`
+    storage_emulator_host: ?[]const u8 = null,
 };
 
 pub const Server = struct {
@@ -146,6 +151,12 @@ pub const Server = struct {
     rng: std.Random.DefaultPrng,
     /// Host:port, for the selfLink-style URLs handlers build.
     endpoint: []const u8,
+    /// The objects gs:// load sources name. Null when no Cloud Storage emulator is configured.
+    storage: ?gcs.Store = null,
+    /// The Cloud Storage emulator's base URL, for messages that name it.
+    storage_endpoint: []const u8 = "",
+    /// What `storage` points at when it reads over HTTP.
+    http_store: gcs.HttpStore = undefined,
 
     /// error.DatabaseOpenFailed means `opts.database` could not be opened, and the log says why.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, opts: Options) !*Server {
@@ -172,6 +183,12 @@ pub const Server = struct {
 
         s.project = try arena.dupe(u8, opts.project);
         s.endpoint = try std.fmt.allocPrint(arena, "{s}:{d}", .{ opts.host, opts.port });
+        // An empty setting, as from STORAGE_EMULATOR_HOST= in a compose file, means no emulator.
+        if (opts.storage_emulator_host) |host| if (host.len > 0) {
+            s.storage_endpoint = try gcs.endpointFrom(arena, host);
+            s.http_store = .{ .gpa = gpa, .io = io, .endpoint = s.storage_endpoint };
+            s.storage = s.http_store.store();
+        };
 
         const store = try storage_mod.Storage.resolve(arena, opts.database);
         var failure: OpenFailure = .{};
@@ -393,6 +410,12 @@ pub const Server = struct {
             ),
 
             .tabledata_insert_all => s.handleTabledataInsertAll(
+                req,
+                m.captures.get(0),
+                m.captures.get(1),
+                m.captures.get(2),
+            ),
+            .tabledata_list => s.handleTabledataList(
                 req,
                 m.captures.get(0),
                 m.captures.get(1),
@@ -1198,6 +1221,81 @@ pub const Server = struct {
     /// Responds:
     /// 200 OK: batch was written; per-row errors may appear in `inserErrors`
     /// 500: internal engine failure
+    /// tabledata.list: a page of a table's rows. rest/v2/tabledata/list
+    fn handleTabledataList(
+        s: *Server,
+        req: *const http_server.Request,
+        project_id: []const u8,
+        dataset_id: []const u8,
+        table_id: []const u8,
+    ) !http_server.Response {
+        const arena = req.arena;
+        // A query's destination table lives in the anonymous dataset, which no one declares.
+        if (try s.db.catalogTable(arena, project_id, dataset_id, table_id) == null) {
+            const anonymous = std.mem.eql(u8, dataset_id, job_rows_vtab.anon_segment);
+            if (!anonymous and !try s.db.datasetExists(arena, project_id, dataset_id)) {
+                return datasetNotFound(arena, project_id, dataset_id);
+            }
+            return notFound(arena, try std.fmt.allocPrint(
+                arena,
+                "Not found: Table {s}:{s}.{s}",
+                .{ project_id, dataset_id, table_id },
+            ));
+        }
+
+        var select_list: std.ArrayList(u8) = .empty;
+        const fields = if (req.queryParam("selectedFields")) |encoded|
+            try selectedFields(arena, encoded)
+        else
+            &.{};
+        read_service.appendSelectList(arena, &select_list, fields) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            error.MalformedFieldName => return badRequest(arena, "invalid selectedFields"),
+        };
+        const table = try std.fmt.allocPrint(
+            arena,
+            "`{s}.{s}.{s}`",
+            .{ project_id, dataset_id, table_id },
+        );
+
+        const counted = try query_handler.collectResultSet(
+            arena,
+            s.db,
+            try std.fmt.allocPrint(arena, "SELECT COUNT(*) FROM {s}", .{table}),
+            &.{},
+        );
+        const count = counted.set orelse
+            return .{ .status = counted.status, .body = counted.body };
+
+        // startIndex applies when no pageToken resumes a read.
+        var page = query_handler.parseResultsPage(arena, req.query);
+        if (req.queryParam("pageToken") == null) {
+            if (req.queryParam("startIndex")) |text| {
+                page.start = std.fmt.parseInt(usize, text, 10) catch 0;
+            }
+        }
+        const take: i64 = if (page.max_results < 0) std.math.maxInt(i64) else page.max_results;
+        const read = try query_handler.collectResultSet(
+            arena,
+            s.db,
+            try std.fmt.allocPrint(
+                arena,
+                "SELECT {s} FROM {s} LIMIT {d} OFFSET {d}",
+                .{ select_list.items, table, take, page.start },
+            ),
+            &.{},
+        );
+        const rows = read.set orelse return .{ .status = read.status, .body = read.body };
+
+        var out: std.ArrayList(u8) = .empty;
+        try query_handler.writeTableDataList(arena, &out, .{
+            .rows = rows,
+            .total = @intCast(count.cells[0].int),
+            .start = page.start,
+        }, query_handler.int64TimestampFromQuery(arena, req.query));
+        return .{ .body = out.items };
+    }
+
     fn handleTabledataInsertAll(
         s: *Server,
         req: *const http_server.Request,
@@ -1301,10 +1399,15 @@ pub const Server = struct {
             return badRequest(arena, "failed to decode request body");
         };
 
+        const job_id = switch (try s.claimJobId(arena, project_id, job)) {
+            .id => |id| id,
+            .refused => |response| return response,
+        };
+
         return switch (jobConfigKind(job)) {
-            .query => s.handleQueryJob(arena, req, project_id, job),
-            .copy => s.handleCopyConfig(arena, project_id, job),
-            .load => s.handleLoadConfig(arena, req, project_id, job),
+            .query => s.handleQueryJob(arena, req, project_id, job_id, job),
+            .copy => s.handleCopyConfig(arena, project_id, job_id, job),
+            .load => s.handleLoadConfig(arena, project_id, job_id, job),
             .extract => badRequest(arena, "configuration.extract is not supported"),
             .none => badRequest(
                 arena,
@@ -1326,10 +1429,57 @@ pub const Server = struct {
         return .none;
     }
 
+    /// The id a new job takes: the request's jobReference.jobId, or a fresh one when it names
+    /// none. rest/v2/JobReference
+    const JobIdClaim = union(enum) {
+        id: []const u8,
+        /// The answer to a request whose jobId is malformed or names a job that exists.
+        refused: http_server.Response,
+    };
+
+    fn claimJobId(
+        s: *Server,
+        arena: std.mem.Allocator,
+        project_id: []const u8,
+        job: *const pb.Job,
+    ) !JobIdClaim {
+        const requested = if (job.job_reference) |ref| ref.job_id else null;
+        const job_id = requested orelse
+            return .{ .id = try query_handler.randomId(arena, &s.rng) };
+        if (!isValidJobId(job_id)) return .{ .refused = try badRequest(
+            arena,
+            try std.fmt.allocPrint(
+                arena,
+                "Invalid job ID \"{s}\". Job IDs must be alphanumeric (plus underscores " ++
+                    "and dashes) and must be at most 1024 characters long.",
+                .{job_id},
+            ),
+        ) };
+        if (s.jobs.get(job_id) != null) return .{ .refused = .{
+            .status = .conflict,
+            .body = try errors.body(arena, .duplicate, try std.fmt.allocPrint(
+                arena,
+                "Already Exists: Job {s}:US.{s}",
+                .{ project_id, job_id },
+            )),
+        } };
+        return .{ .id = job_id };
+    }
+
+    /// Letters, digits, underscores and dashes, 1 to 1,024 of them. rest/v2/JobReference
+    fn isValidJobId(job_id: []const u8) bool {
+        if (job_id.len == 0 or job_id.len > 1024) return false;
+        for (job_id) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '_' and c != '-') return false;
+        }
+        return true;
+    }
+
     fn handleCopyConfig(
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
+        job_id: []const u8,
         job: *const pb.Job,
     ) !http_server.Response {
         const parsed = copy_handler.parse(arena, job) catch |err| switch (err) {
@@ -1337,29 +1487,30 @@ pub const Server = struct {
             else => return badRequest(arena, copy_handler.parseErrorMessage(err)),
         };
         const copy = parsed orelse return badRequest(arena, "configuration.copy is required");
-        return s.handleCopyJob(arena, project_id, copy);
+        return s.handleCopyJob(arena, project_id, job_id, copy);
     }
 
     /// A load job posted to `/jobs` rather than to the upload endpoint, so it names its data
-    /// rather than carrying it.
+    /// in sourceUris rather than carrying it.
     fn handleLoadConfig(
         s: *Server,
         arena: std.mem.Allocator,
-        req: *const http_server.Request,
         project_id: []const u8,
+        job_id: []const u8,
         job: *const pb.Job,
     ) !http_server.Response {
-        _ = s;
-        _ = req;
-        _ = project_id;
-        const cfg = job.configuration.?.load.?;
-        if (cfg.source_uris.len != 0) {
+        const parsed = load_handler.parse(job) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return badRequest(arena, load_handler.parseErrorMessage(err)),
+        };
+        const spec = parsed.?;
+        if (spec.source_uris.len == 0) {
             return badRequest(
                 arena,
-                "configuration.load.sourceUris is not supported: upload the data instead",
+                "configuration.load needs sourceUris, or its data sent to the upload endpoint",
             );
         }
-        return badRequest(arena, "configuration.load requires the upload endpoint");
+        return s.runLoad(arena, project_id, job_id, spec, .uris);
     }
 
     // ---- the media upload endpoint ----
@@ -1391,8 +1542,7 @@ pub const Server = struct {
         return s.runLoadJob(arena, project_id, parts.metadata, parts.media);
     }
 
-    /// The initiating request of a resumable upload. Answers with the session URI the bytes
-    /// are sent to. api-uploads
+    /// The initiating request of a resumable upload.
     fn openUploadSession(
         s: *Server,
         req: *const http_server.Request,
@@ -1426,7 +1576,7 @@ pub const Server = struct {
                     arena,
                     "http://{s}/upload/bigquery/v2/projects/{s}/jobs" ++
                         "?uploadType=resumable&upload_id={s}",
-                    .{ s.endpoint, project_id, id },
+                    .{ req.headers.host orelse s.endpoint, project_id, id },
                 ),
             }}),
         };
@@ -1493,9 +1643,6 @@ pub const Server = struct {
     }
 
     /// Reads `media` under the configuration in `metadata` and writes the rows it yields.
-    ///
-    /// Everything settled without writing a row answers the upload request; a failure found
-    /// while reading rows completes the job and rides in status.errorResult. docs/adr/0002
     fn runLoadJob(
         s: *Server,
         arena: std.mem.Allocator,
@@ -1512,7 +1659,42 @@ pub const Server = struct {
         };
         const spec = parsed orelse
             return badRequest(arena, "the upload carries no configuration.load");
+        if (spec.source_uris.len != 0) {
+            return badRequest(
+                arena,
+                "an upload carries its data, so configuration.load.sourceUris must be empty",
+            );
+        }
+        const job_id = switch (try s.claimJobId(arena, project_id, job)) {
+            .id => |id| id,
+            .refused => |response| return response,
+        };
+        return s.runLoad(arena, project_id, job_id, spec, .{ .media = media });
+    }
 
+    /// Where a load job's bytes come from.
+    const LoadData = union(enum) {
+        /// The body of an upload.
+        media: []const u8,
+        /// The gs:// objects the job's sourceUris name.
+        uris,
+    };
+
+    /// The most a gs:// load reads across all its sources, the same as one resumable upload.
+    const max_load_source_bytes = upload.max_session_bytes;
+
+    /// Reads a load job's sources and writes the rows they yield.
+    ///
+    /// Everything settled without reading a source answers the request; a failure found while
+    /// reading sources or rows completes the job and rides in status.errorResult. docs/adr/0002
+    fn runLoad(
+        s: *Server,
+        arena: std.mem.Allocator,
+        project_id: []const u8,
+        job_id: []const u8,
+        spec: load_handler.LoadSpec,
+        data: LoadData,
+    ) !http_server.Response {
         const dst = spec.destination;
         if (!try s.db.datasetExists(arena, dst.project_id, dst.dataset_id)) {
             return datasetNotFound(arena, dst.project_id, dst.dataset_id);
@@ -1525,7 +1707,6 @@ pub const Server = struct {
             dst.table_id,
         );
 
-        const job_id = try query_handler.randomId(arena, &s.rng);
         const unix_seconds = @divFloor(@as(i64, @bitCast(nowSeed())), 1_000_000);
 
         // CREATE_NEVER reports a missing destination in the job result.
@@ -1557,9 +1738,52 @@ pub const Server = struct {
             }
         }
 
-        const read = load_rows.read(arena, media, spec, existing) catch |err| switch (err) {
+        const sources: []const []const u8 = switch (data) {
+            .media => |media| try arena.dupe([]const u8, &.{media}),
+            .uris => blk: {
+                const store = s.storage orelse return s.storeLoadJob(
+                    arena,
+                    project_id,
+                    job_id,
+                    spec,
+                    unix_seconds,
+                    .{ .failed = .{
+                        .reason = "invalid",
+                        .message = "gs:// sources need a Cloud Storage emulator: start the " ++
+                            "server with STORAGE_EMULATOR_HOST or --storage-emulator-host",
+                    } },
+                );
+                const reader: gcs.Reader = .{
+                    .store = store,
+                    .endpoint = s.storage_endpoint,
+                    .limit = max_load_source_bytes,
+                    .deadline = .fromNow(s.io, .{ .raw = gcs.load_timeout, .clock = .awake }),
+                };
+                switch (try gcs.readSources(arena, reader, spec.source_uris)) {
+                    .read => |objects| break :blk objects,
+                    .failed => |failure| return s.storeLoadJob(
+                        arena,
+                        project_id,
+                        job_id,
+                        spec,
+                        unix_seconds,
+                        .{ .failed = .{ .reason = failure.reason, .message = failure.message } },
+                    ),
+                }
+            },
+        };
+        var input_file_bytes: u64 = 0;
+        for (sources) |source| input_file_bytes += source.len;
+
+        // An upload's unreadable bytes answer its request; a gs:// source's complete the job.
+        const read = load_rows.readMany(arena, sources, spec, existing) catch |err| switch (err) {
             error.OutOfMemory => return err,
-            else => return badRequest(arena, load_rows.readErrorMessage(err)),
+            else => switch (data) {
+                .media => return badRequest(arena, load_rows.readErrorMessage(err)),
+                .uris => return s.storeLoadJob(arena, project_id, job_id, spec, unix_seconds, .{
+                    .failed = .{ .reason = "invalid", .message = load_rows.readErrorMessage(err) },
+                }),
+            },
         };
 
         const tooManyBadRecords = struct {
@@ -1619,7 +1843,8 @@ pub const Server = struct {
 
         return s.storeLoadJob(arena, project_id, job_id, spec, unix_seconds, .{
             .loaded = .{
-                .input_file_bytes = media.len,
+                .input_files = sources.len,
+                .input_file_bytes = input_file_bytes,
                 .output_rows = read.rowCount() - rejected,
                 .bad_records = bad_records,
             },
@@ -1705,7 +1930,7 @@ pub const Server = struct {
             .load = spec,
             .outcome = outcome,
         });
-        try s.jobs.put(project_id, job_id, .load, .{
+        try s.jobs.put(project_id, job_id, .load, "", .{
             .names = &.{},
             .types = &.{},
             .cells = &.{},
@@ -1735,6 +1960,7 @@ pub const Server = struct {
         arena: std.mem.Allocator,
         req: *const http_server.Request,
         project_id: []const u8,
+        job_id: []const u8,
         job: *const pb.Job,
     ) !http_server.Response {
         const sql = jobs_handler.queryFromJobConfig(job) orelse {
@@ -1747,7 +1973,6 @@ pub const Server = struct {
             => return badRequest(arena, "invalid query parameter"),
         };
 
-        const job_id = try query_handler.randomId(arena, &s.rng);
         const job_t0 = nowSeed();
 
         // Go's jobsInsertHandler never calls internaltypes.Format — only
@@ -1842,9 +2067,11 @@ pub const Server = struct {
         }
 
         var resource: std.ArrayList(u8) = .empty;
+        const destination_table_id = try query_handler.randomId(arena, &s.rng);
         try jobs_handler.writeJobResource(arena, &resource, .{
             .project_id = project_id,
             .job_id = job_id,
+            .destination_table_id = destination_table_id,
             .sql = sql,
             .endpoint = s.endpoint,
             .total_bytes = res.total_bytes,
@@ -1852,7 +2079,14 @@ pub const Server = struct {
             .outcome = res.set.?.outcome,
         });
 
-        try s.jobs.put(project_id, job_id, .query, res.set.?, resource.items);
+        try s.jobs.put(
+            project_id,
+            job_id,
+            .query,
+            destination_table_id,
+            res.set.?,
+            resource.items,
+        );
         // The destination table the resource above advertises. Registered now,
         // eagerly, because it costs nothing to: the rows are already in the
         // store and the table is a view onto them rather than a copy
@@ -1895,7 +2129,7 @@ pub const Server = struct {
         return names.toOwnedSlice(arena);
     }
 
-    /// Makes a finished job's result readable as `<project>._anon.<job_id>`.
+    /// Makes a finished job's result readable as `<project>._anon.<destination_table_id>`.
     ///
     /// Two halves, and neither copies a row. A synthetic `TableSpec` so the
     /// GoogleSQL analyzer resolves the name — memory-only, because the rows
@@ -1930,7 +2164,7 @@ pub const Server = struct {
         const name_path = try job_arena.alloc([]const u8, 3);
         name_path[0] = try job_arena.dupe(u8, project_id);
         name_path[1] = job_rows_vtab.anon_segment;
-        name_path[2] = job.job_id;
+        name_path[2] = job.destination_table_id;
         const table_spec = try job_arena.create(zigquery.spec.TableSpec);
         table_spec.* = .{ .name_path = name_path, .columns = columns };
 
@@ -1993,6 +2227,7 @@ pub const Server = struct {
         s: *Server,
         arena: std.mem.Allocator,
         project_id: []const u8,
+        job_id: []const u8,
         copy: copy_handler.CopySpec,
     ) !http_server.Response {
         for (copy.sources) |src| {
@@ -2015,7 +2250,6 @@ pub const Server = struct {
             ) orelse return notFound(arena, try tableNotFound(arena, src));
         }
 
-        const job_id = try query_handler.randomId(arena, &s.rng);
         const unix_seconds = @divFloor(@as(i64, @bitCast(nowSeed())), 1_000_000);
 
         const prior_metadata: []const u8 = if (try s.db.catalogTable(
@@ -2056,7 +2290,7 @@ pub const Server = struct {
         });
         // No result set: a copy job's rows are in the destination, and getQueryResults refuses
         // a job that is not a query job.
-        try s.jobs.put(project_id, job_id, .copy, .{
+        try s.jobs.put(project_id, job_id, .copy, "", .{
             .names = &.{},
             .types = &.{},
             .cells = &.{},
@@ -2328,6 +2562,16 @@ pub const Server = struct {
     }
 };
 
+/// tabledata.list's selectedFields: comma-separated top-level column names, percent-encoded
+/// on the wire. An empty name stays in, for the select list to refuse.
+fn selectedFields(arena: std.mem.Allocator, encoded: []const u8) ![]const []const u8 {
+    const decoded = std.Uri.percentDecodeInPlace(try arena.dupe(u8, encoded));
+    var out: std.ArrayList([]const u8) = .empty;
+    var names = std.mem.splitScalar(u8, decoded, ',');
+    while (names.next()) |raw| try out.append(arena, std.mem.trim(u8, raw, " "));
+    return out.items;
+}
+
 fn notFound(arena: std.mem.Allocator, msg: []const u8) !http_server.Response {
     return .{ .status = .not_found, .body = try errors.body(arena, .not_found, msg) };
 }
@@ -2416,6 +2660,13 @@ fn jobIdOf(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     return v.object.get("jobReference").?.object.get("jobId").?.string;
 }
 
+/// `configuration.query.destinationTable.tableId` out of a query job resource.
+fn destinationOf(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+    const v = try std.json.parseFromSliceLeaky(std.json.Value, arena, body, .{});
+    const query = v.object.get("configuration").?.object.get("query").?;
+    return query.object.get("destinationTable").?.object.get("tableId").?.string;
+}
+
 /// The single cell of a one-row, one-column response.
 fn onlyCell(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
     const cells = try cellsOf(arena, body);
@@ -2489,6 +2740,112 @@ test "jobs.query binds a named scalar parameter" {
     );
     try testing.expectEqual(std.http.Status.ok, res.status);
     try testing.expectEqualStrings("hix", try onlyCell(arena, res.body));
+}
+
+test "jobs.insert keeps the client's jobId and refuses it a second time" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const body =
+        \\{"jobReference":{"projectId":"test","jobId":"nightly_export-42"},
+        \\ "configuration":{"query":{"query":"SELECT 7 AS n","useLegacySql":false}}}
+    ;
+    const first = try request(s, arena, .POST, "/projects/test/jobs", body);
+    try testing.expectEqual(std.http.Status.ok, first.status);
+    try testing.expectEqualStrings("nightly_export-42", try jobIdOf(arena, first.body));
+
+    const results = try request(s, arena, .GET, "/projects/test/queries/nightly_export-42", "");
+    try testing.expectEqual(std.http.Status.ok, results.status);
+
+    const again = try request(s, arena, .POST, "/projects/test/jobs", body);
+    try testing.expectEqual(std.http.Status.conflict, again.status);
+    try testing.expectEqualStrings(
+        \\{"error":{"errors":[{"reason":"duplicate","location":"","debugInfo":"","message":"Already Exists: Job test:US.nightly_export-42"}],"code":409,"message":"Already Exists: Job test:US.nightly_export-42"}}
+    , again.body);
+}
+
+test "a client jobId that is no table id still gets a destination table" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const insert = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"jobReference":{"jobId":"9f0c2d4e-7b1a-4c3e-8d2f-5a6b7c8d9e0f"},
+        \\ "configuration":{"query":{"query":"SELECT 3 AS v","useLegacySql":false}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, insert.status);
+    const table_id = try destinationOf(arena, insert.body);
+    try testing.expect(!std.mem.eql(u8, table_id, try jobIdOf(arena, insert.body)));
+
+    const sql = try std.fmt.allocPrint(arena, "SELECT v FROM `_anon`.`{s}`", .{table_id});
+    var rows = try s.db.query(sql, &.{}, .{});
+    defer rows.deinit();
+    try testing.expectEqual(@as(i64, 3), (try rows.next()).?[0].int);
+}
+
+test "jobs.insert refuses a malformed jobId" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"jobReference":{"jobId":"has a space"},
+        \\ "configuration":{"query":{"query":"SELECT 1","useLegacySql":false}}}
+    );
+    try testing.expectEqual(std.http.Status.bad_request, res.status);
+}
+
+test "a resumable session URI names the Host the client sent, else the bind address" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+
+    const metadata =
+        \\{"configuration":{"load":{"destinationTable":
+        \\ {"projectId":"test","datasetId":"ds","tableId":"t"}}}}
+    ;
+    const addressed = try s.handler().func(s.handler().ctx, &.{
+        .method = .POST,
+        .path = "/upload/bigquery/v2/projects/test/jobs",
+        .query = "uploadType=resumable",
+        .headers = .{ .host = "bigquery-emulator:9050" },
+        .body = metadata,
+        .arena = arena,
+    });
+    try testing.expectEqual(std.http.Status.ok, addressed.status);
+    try testing.expectEqualStrings("location", addressed.extra_headers[0].name);
+    try testing.expect(std.mem.startsWith(
+        u8,
+        addressed.extra_headers[0].value,
+        "http://bigquery-emulator:9050/upload/bigquery/v2/projects/test/jobs?uploadType=resumable",
+    ));
+
+    const bare = try requestQuery(
+        s,
+        arena,
+        .POST,
+        "/upload/bigquery/v2/projects/test/jobs",
+        "uploadType=resumable",
+        metadata,
+    );
+    try testing.expect(std.mem.startsWith(
+        u8,
+        bare.extra_headers[0].value,
+        try std.fmt.allocPrint(arena, "http://{s}/upload/", .{s.endpoint}),
+    ));
 }
 
 test "jobs.insert binds a positional parameter" {
@@ -2848,18 +3205,18 @@ test "a query job's destination table is readable the moment the job returns" {
         \\"useLegacySql":false}}}
     );
     try testing.expectEqual(std.http.Status.ok, insert.status);
-    const job_id = try jobIdOf(arena, insert.body);
+    const table_id = try destinationOf(arena, insert.body);
 
     // The resource names it, and tables.get now answers on it.
     try testing.expect(std.mem.indexOf(u8, insert.body, "\"datasetId\":\"_anon\"") != null);
-    const path = try std.fmt.allocPrint(arena, "/projects/test/datasets/_anon/tables/{s}", .{job_id});
+    const path = try std.fmt.allocPrint(arena, "/projects/test/datasets/_anon/tables/{s}", .{table_id});
     const got = try request(s, arena, .GET, path, "");
     try testing.expectEqual(std.http.Status.ok, got.status);
     try testing.expect(std.mem.indexOf(u8, got.body, "\"name\":\"n\"") != null);
 
     // And it holds the job's rows -- read back through the engine, which is
     // the path CreateReadSession and ReadRows take.
-    const sql = try std.fmt.allocPrint(arena, "SELECT n, t FROM `_anon`.`{s}`", .{job_id});
+    const sql = try std.fmt.allocPrint(arena, "SELECT n, t FROM `_anon`.`{s}`", .{table_id});
     var rows = try s.db.query(sql, &.{}, .{});
     defer rows.deinit();
     var seen: usize = 0;
@@ -2896,7 +3253,9 @@ test "the destination table and getQueryResults agree, because they share one co
     );
     try testing.expectEqualStrings("1767268800.0", try onlyCell(arena, results.body));
 
-    const sql = try std.fmt.allocPrint(arena, "SELECT ts, s FROM `_anon`.`{s}`", .{job_id});
+    const sql = try std.fmt.allocPrint(arena, "SELECT ts, s FROM `_anon`.`{s}`", .{
+        try destinationOf(arena, insert.body),
+    });
     var rows = try s.db.query(sql, &.{}, .{});
     defer rows.deinit();
     const row = (try rows.next()).?;
@@ -3116,9 +3475,9 @@ test "a DDL job registers no destination table" {
         \\"useLegacySql":false}}}
     );
     try testing.expectEqual(std.http.Status.ok, insert.status);
-    const job_id = try jobIdOf(arena, insert.body);
+    const table_id = try destinationOf(arena, insert.body);
 
-    const path = try std.fmt.allocPrint(arena, "/projects/test/datasets/_anon/tables/{s}", .{job_id});
+    const path = try std.fmt.allocPrint(arena, "/projects/test/datasets/_anon/tables/{s}", .{table_id});
     const got = try request(s, arena, .GET, path, "");
     try testing.expectEqual(std.http.Status.not_found, got.status);
 }
@@ -3137,9 +3496,9 @@ test "a zero-row SELECT still gets an empty destination table" {
         \\{"configuration":{"query":{"query":
         \\"SELECT n FROM UNNEST(GENERATE_ARRAY(1, 0)) AS n","useLegacySql":false}}}
     );
-    const job_id = try jobIdOf(arena, insert.body);
+    const table_id = try destinationOf(arena, insert.body);
 
-    const sql = try std.fmt.allocPrint(arena, "SELECT n FROM `_anon`.`{s}`", .{job_id});
+    const sql = try std.fmt.allocPrint(arena, "SELECT n FROM `_anon`.`{s}`", .{table_id});
     var rows = try s.db.query(sql, &.{}, .{});
     defer rows.deinit();
     try testing.expectEqual(@as(?[]const driver.Cell, null), try rows.next());
@@ -3153,10 +3512,10 @@ test "two jobs' destination tables do not collide in the shared dataset" {
     var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
     defer s.deinit();
 
-    const a = try jobIdOf(arena, (try request(s, arena, .POST, "/projects/test/jobs",
+    const a = try destinationOf(arena, (try request(s, arena, .POST, "/projects/test/jobs",
         \\{"configuration":{"query":{"query":"SELECT 1 AS v","useLegacySql":false}}}
     )).body);
-    const b = try jobIdOf(arena, (try request(s, arena, .POST, "/projects/test/jobs",
+    const b = try destinationOf(arena, (try request(s, arena, .POST, "/projects/test/jobs",
         \\{"configuration":{"query":{"query":"SELECT 2 AS v","useLegacySql":false}}}
     )).body);
     try testing.expect(!std.mem.eql(u8, a, b));
@@ -3637,6 +3996,111 @@ test "insertAll writes rows that a later query can read" {
     try testing.expectEqual(std.http.Status.ok, q.status);
     try testing.expect(std.mem.indexOf(u8, q.body, "{\"v\":\"Alice\"}") != null);
     try testing.expect(std.mem.indexOf(u8, q.body, "Bob") == null);
+}
+
+test "tabledata.list pages a table's rows" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    try createStreamTable(s, arena, "streamed");
+    const insert = try request(s, arena, .POST, "/projects/test/datasets/ds1/tables/streamed/insertAll",
+        \\{"rows":[{"json":{"name":"Alice","age":30}},{"json":{"name":"Bob","age":25}},
+        \\ {"json":{"name":"Carol","age":41}}]}
+    );
+    try testing.expectEqual(std.http.Status.ok, insert.status);
+
+    const first = try requestQuery(
+        s,
+        arena,
+        .GET,
+        "/projects/test/datasets/ds1/tables/streamed/data",
+        "maxResults=2",
+        "",
+    );
+    try testing.expectEqual(std.http.Status.ok, first.status);
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","pageToken":"2","rows":[{"f":[{"v":"Alice"},{"v":"30"}]},{"f":[{"v":"Bob"},{"v":"25"}]}]}
+    , first.body);
+
+    const rest = try requestQuery(
+        s,
+        arena,
+        .GET,
+        "/projects/test/datasets/ds1/tables/streamed/data",
+        "maxResults=2&pageToken=2",
+        "",
+    );
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","rows":[{"f":[{"v":"Carol"},{"v":"41"}]}]}
+    , rest.body);
+
+    const selected = try requestQuery(
+        s,
+        arena,
+        .GET,
+        "/projects/test/datasets/ds1/tables/streamed/data",
+        "selectedFields=age&startIndex=1",
+        "",
+    );
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","rows":[{"f":[{"v":"25"}]},{"f":[{"v":"41"}]}]}
+    , selected.body);
+}
+
+test "tabledata.list reads a query's destination table" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test" });
+    defer s.deinit();
+    const insert = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"query":{"query":
+        \\"SELECT n FROM UNNEST([4, 5, 6]) AS n ORDER BY n","useLegacySql":false}}}
+    );
+    const path = try std.fmt.allocPrint(
+        arena,
+        "/projects/test/datasets/_anon/tables/{s}/data",
+        .{try destinationOf(arena, insert.body)},
+    );
+
+    const res = try requestQuery(s, arena, .GET, path, "maxResults=1&pageToken=1", "");
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expectEqualStrings(
+        \\{"kind":"bigquery#tableDataList","totalRows":"3","pageToken":"2","rows":[{"f":[{"v":"5"}]}]}
+    , res.body);
+}
+
+test "tabledata.list refuses a selected field that is not a column name" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    try createStreamTable(s, arena, "streamed");
+
+    const path = "/projects/test/datasets/ds1/tables/streamed/data";
+    for ([_][]const u8{ "selectedFields=1age", "selectedFields=age%2C", "selectedFields=a%60b" }) |q| {
+        const res = try requestQuery(s, arena, .GET, path, q, "");
+        try testing.expectEqual(std.http.Status.bad_request, res.status);
+    }
+}
+
+test "tabledata.list on a missing table is a 404" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+
+    const res = try request(s, arena, .GET, "/projects/test/datasets/ds1/tables/absent/data", "");
+    try testing.expectEqual(std.http.Status.not_found, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "Not found: Table test:ds1.absent") != null);
 }
 
 test "posted table fields survive a round trip, and patch merges over them" {
@@ -4325,11 +4789,10 @@ test "a query's result table cannot be patched into the catalog" {
     const insert = try request(s, arena, .POST, "/projects/test/jobs",
         \\{"configuration":{"query":{"query":"SELECT 1 AS n"}}}
     );
-    const job_id = try jobIdOf(arena, insert.body);
     const path = try std.fmt.allocPrint(
         arena,
         "/projects/test/datasets/_anon/tables/{s}",
-        .{job_id},
+        .{try destinationOf(arena, insert.body)},
     );
 
     const patched = try request(s, arena, .PATCH, path, "{\"description\":\"phantom\"}");
@@ -5528,6 +5991,114 @@ test "sources whose schemas disagree are refused before the destination is touch
     // Nothing was written: the destination never came into existence.
     const missing = try request(s, arena, .GET, "/projects/test/datasets/d/tables/dst", "");
     try testing.expectEqual(std.http.Status.not_found, missing.status);
+}
+
+test "a gs:// load reads its objects from the configured storage" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    var memory: gcs.MemoryStore = .{ .arena = arena };
+    const storage = memory.store();
+    const first: gcs.Uri = .{ .bucket = "staging", .object = "shards/part-0.csv" };
+    const second: gcs.Uri = .{ .bucket = "staging", .object = "shards/part-1.csv" };
+    try storage.put(arena, first, "id,district\n1,NORTH\n");
+    try storage.put(arena, second, "id,district\n2,SOUTH\n");
+    s.storage = storage;
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"load":{"sourceUris":["gs://staging/shards/part-*.csv"],
+        \\ "skipLeadingRows":1,
+        \\ "schema":{"fields":[{"name":"id","type":"INTEGER"},{"name":"district","type":"STRING"}]},
+        \\ "destinationTable":{"projectId":"test","datasetId":"ds1","tableId":"people"}}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"errorResult\"") == null);
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"inputFiles\":\"2\"") != null);
+    try testing.expect(
+        std.mem.indexOf(u8, res.body, "\"sourceUris\":[\"gs://staging/shards/part-*.csv\"]") != null,
+    );
+
+    const count = try request(s, arena, .POST, "/projects/test/queries",
+        \\{"query":"SELECT COUNT(*) FROM `test.ds1.people`","useLegacySql":false}
+    );
+    try testing.expectEqualStrings("2", try onlyCell(arena, count.body));
+}
+
+test "a gs:// object that cannot be read as its format fails the job, not the request" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+    var memory: gcs.MemoryStore = .{ .arena = arena };
+    const storage = memory.store();
+    const object: gcs.Uri = .{ .bucket = "staging", .object = "people.json" };
+    try storage.put(arena, object, "[1, 2, 3]\n");
+    s.storage = storage;
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"jobReference":{"jobId":"bad_json_load"},
+        \\ "configuration":{"load":{"sourceUris":["gs://staging/people.json"],
+        \\ "sourceFormat":"NEWLINE_DELIMITED_JSON","autodetect":true,
+        \\ "destinationTable":{"projectId":"test","datasetId":"ds1","tableId":"people"}}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"errorResult\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res.body, "must be an object") != null);
+
+    const got = try request(s, arena, .GET, "/projects/test/jobs/bad_json_load", "");
+    try testing.expectEqual(std.http.Status.ok, got.status);
+}
+
+test "a gs:// load with no storage configured fails the job, naming the setting" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{ .project = "test", .dataset = "ds1" });
+    defer s.deinit();
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"load":{"sourceUris":["gs://staging/people.csv"],"autodetect":true,
+        \\ "destinationTable":{"projectId":"test","datasetId":"ds1","tableId":"people"}}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "\"errorResult\"") != null);
+    try testing.expect(std.mem.indexOf(u8, res.body, "STORAGE_EMULATOR_HOST") != null);
+}
+
+test "an empty storage emulator host leaves gs:// loads failing the job" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var s = try Server.init(testing.allocator, testing.io, .{
+        .project = "test",
+        .dataset = "ds1",
+        .storage_emulator_host = "",
+    });
+    defer s.deinit();
+
+    const res = try request(s, arena, .POST, "/projects/test/jobs",
+        \\{"configuration":{"load":{"sourceUris":["gs://staging/people.csv"],"autodetect":true,
+        \\ "destinationTable":{"projectId":"test","datasetId":"ds1","tableId":"people"}}}}
+    );
+    try testing.expectEqual(std.http.Status.ok, res.status);
+    try testing.expect(std.mem.indexOf(u8, res.body, "STORAGE_EMULATOR_HOST") != null);
+}
+
+test "a real Cloud Storage host as the storage emulator stops startup" {
+    try testing.expectError(
+        error.RealCloudStorageHost,
+        Server.init(testing.allocator, testing.io, .{
+            .project = "test",
+            .storage_emulator_host = "https://storage.googleapis.com",
+        }),
+    );
 }
 
 test "several sources concatenate into one destination" {
