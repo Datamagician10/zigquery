@@ -13,9 +13,63 @@ const coordinator = @import("../coordinator/coordinator.zig");
 const context = @import("../coordinator/context.zig");
 const types_data = @import("../coordinator/types_data.zig");
 const sqlbuilder = @import("../sqlbuilder/sqlbuilder.zig");
+const value_mod = @import("../value.zig");
 
 const Error = types_data.Error;
 const SQLExpression = sqlbuilder.SQLExpression;
+
+// ----------------------------------------------------------------------
+// Analytic option rejections (issue #41): the handful of window functions
+// BigQuery refuses to plan when a given aggregate option is present. The
+// map lives here, in one place, and the check runs at transform time —
+// before any SQL is generated or executed — rather than inside each
+// window function's runtime implementation.
+//
+// Options reach this layer as trailing pseudo-args on the extracted call
+// (zigquery_distinct / zigquery_ignore_nulls; see extractor.zig). RESPECT
+// NULLS emits no marker (it is the default), so an explicit RESPECT NULLS
+// is indistinguishable here; BigQuery's own message names both options.
+// The GROUP BY aggregates are a different scan and keep both options, and
+// analytic aggregates not in this map (MIN, SUM, COUNT, ...) keep them
+// too — the rejection is per-function, not a blanket ban.
+// ----------------------------------------------------------------------
+
+const AnalyticOptionRejection = struct {
+    /// Window runtime name of the function, e.g. "zigquery_window_string_agg".
+    function: []const u8,
+    /// Pseudo-arg encoding the rejected option, e.g. "zigquery_distinct".
+    option: []const u8,
+    /// BigQuery's error message for the combination.
+    message: []const u8,
+};
+
+const analytic_option_rejections = [_]AnalyticOptionRejection{
+    .{
+        .function = "zigquery_window_string_agg",
+        .option = "zigquery_distinct",
+        .message = "Analytic function string_agg does not support DISTINCT.",
+    },
+    .{
+        .function = "zigquery_window_array_agg",
+        .option = "zigquery_ignore_nulls",
+        .message = "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
+    },
+};
+
+fn checkAnalyticOptionRejections(func_data: *const types_data.ComputedColumnData) Error!void {
+    if (func_data.expression.type != .function) return;
+    const function = func_data.expression.function orelse return;
+    for (analytic_option_rejections) |rejection| {
+        if (!std.mem.eql(u8, function.name, rejection.function)) continue;
+        for (function.arguments) |arg| {
+            if (arg.type != .function) continue;
+            const arg_function = arg.function orelse continue;
+            if (!std.mem.eql(u8, arg_function.name, rejection.option)) continue;
+            value_mod.setDiagnostic("{s}", .{rejection.message});
+            return error.UnsupportedFunction;
+        }
+    }
+}
 
 pub fn transform(
     coord: *coordinator.QueryCoordinator,
@@ -36,6 +90,9 @@ pub fn transform(
     // reference inside one resolves against the input scan's columns.
     var transformed_functions = std.AutoHashMap(i64, *SQLExpression).init(alloc);
     for (analytic_data.function_list) |func_data| {
+        // Reject the function/option combinations BigQuery refuses to plan
+        // (issue #41) before transforming anything.
+        try checkAnalyticOptionRejections(func_data);
         const col = func_data.column orelse return error.InvalidAST;
         const expr = try coord.transformExpression(func_data.expression, ctx);
         try transformed_functions.put(col.id, expr);
@@ -204,4 +261,65 @@ test "golden SQL: DISTINCT and IGNORE NULLS become trailing pseudo-args" {
         try expectContains(stmts[0], "zigquery_window_first_value(`x__");
         try expectContains(stmts[0], ", zigquery_ignore_nulls()) OVER (");
     }
+}
+
+test "analytic option rejections fail at translate time (issue #41)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // STRING_AGG(DISTINCT x) OVER (): BigQuery refuses to plan it, so
+    // translation itself fails with BigQuery's message — no SQL is produced
+    // and nothing reaches the window runtime.
+    try testing.expectError(error.UnsupportedFunction, driver.translate(
+        alloc,
+        "SELECT STRING_AGG(DISTINCT x) OVER () FROM UNNEST(['a', 'b', 'a']) AS x",
+        .{},
+    ));
+    try testing.expectEqualStrings(
+        "Analytic function string_agg does not support DISTINCT.",
+        value_mod.diagnostic.?,
+    );
+
+    // ARRAY_AGG(x IGNORE NULLS) OVER (): same, with its own message.
+    try testing.expectError(error.UnsupportedFunction, driver.translate(
+        alloc,
+        "SELECT ARRAY_AGG(x IGNORE NULLS) OVER () FROM UNNEST([1, NULL, 2]) AS x",
+        .{},
+    ));
+    try testing.expectEqualStrings(
+        "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
+        value_mod.diagnostic.?,
+    );
+}
+
+test "analytic option rejection controls still translate (issue #41)" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // The same two functions without the rejected option.
+    _ = try driver.translate(
+        alloc,
+        "SELECT STRING_AGG(x) OVER () FROM UNNEST(['a', 'b', 'a']) AS x",
+        .{},
+    );
+    _ = try driver.translate(
+        alloc,
+        "SELECT ARRAY_AGG(x) OVER () FROM UNNEST([1, NULL, 2]) AS x",
+        .{},
+    );
+    // Options not in the map for that function: ARRAY_AGG keeps DISTINCT,
+    // and other analytic aggregates (SUM here) keep DISTINCT too — the
+    // rejection is per-function, not a blanket ban on the option.
+    _ = try driver.translate(
+        alloc,
+        "SELECT ARRAY_AGG(DISTINCT x) OVER () FROM UNNEST([1, 1, 2]) AS x",
+        .{},
+    );
+    _ = try driver.translate(
+        alloc,
+        "SELECT SUM(DISTINCT x) OVER () FROM UNNEST([1, 1, 2]) AS x",
+        .{},
+    );
 }

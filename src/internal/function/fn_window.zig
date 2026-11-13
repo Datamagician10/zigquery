@@ -161,17 +161,9 @@ pub const WINDOW_ARRAY_AGG = struct {
         alloc: std.mem.Allocator,
         agg: *WindowFuncAggregatedStatus,
     ) Error!Value {
-        // BigQuery rejects this combination for the analytic function only:
-        // the GROUP BY aggregate keeps IGNORE NULLS. RESPECT NULLS emits no
-        // marker on the analytic path (it is the default), so an explicit
-        // RESPECT NULLS is indistinguishable here and is not rejected.
-        if (agg.opt.ignore_nulls) {
-            return bind.fail(
-                "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
-                .{},
-                error.UnsupportedOperation,
-            );
-        }
+        // ARRAY_AGG(x IGNORE NULLS) OVER () never reaches here: the
+        // transformer rejects that combination at analyze time (issue #41;
+        // see transformer/scan_analytic.zig).
         return value_mod.arrayValue(alloc, try agg.relevantValues());
     }
 };
@@ -305,17 +297,9 @@ pub const WINDOW_STRING_AGG = struct {
         alloc: std.mem.Allocator,
         agg: *WindowFuncAggregatedStatus,
     ) Error!Value {
-        // BigQuery rejects DISTINCT for the analytic function; the GROUP BY
-        // aggregate keeps it, and other analytic aggregates (MIN, SUM,
-        // COUNT) keep DISTINCT too, so this is per-function, not a blanket
-        // ban on DISTINCT in a window.
-        if (agg.opt.distinct) {
-            return bind.fail(
-                "Analytic function string_agg does not support DISTINCT.",
-                .{},
-                error.UnsupportedOperation,
-            );
-        }
+        // STRING_AGG(DISTINCT x) OVER () never reaches here: the transformer
+        // rejects that combination at analyze time (issue #41; see
+        // transformer/scan_analytic.zig).
         var out: std.ArrayList(u8) = .empty;
         var wrote = false;
         for (try agg.relevantValues()) |v| {
@@ -1021,12 +1005,16 @@ test "relevantValues honors ignore_nulls and distinct" {
     try testing.expectEqual(@as(usize, 3), (try agg.relevantValues()).len);
 }
 
-test "analytic string_agg rejects DISTINCT, array_agg rejects IGNORE NULLS" {
+test "window done() honors options; the #41 rejections live in the transformer" {
+    // STRING_AGG(DISTINCT x) OVER () and ARRAY_AGG(x IGNORE NULLS) OVER ()
+    // are rejected at analyze/transform time (transformer/scan_analytic.zig),
+    // never reaching these runtime implementations. If a call does reach
+    // done(), the options are honored like any other frame: DISTINCT
+    // dedupes and IGNORE NULLS drops the NULL.
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // STRING_AGG(DISTINCT x) OVER (): BigQuery refuses to plan it.
     var agg = WindowFuncAggregatedStatus{ .cache_alloc = alloc };
     try agg.step(alloc, .{ .string = "a" });
     try agg.step(alloc, .{ .string = "b" });
@@ -1035,17 +1023,12 @@ test "analytic string_agg rejects DISTINCT, array_agg rejects IGNORE NULLS" {
     opt.distinct = true;
     agg.setOption(opt);
     var f = WINDOW_STRING_AGG{};
-    try testing.expectError(error.UnsupportedOperation, f.done(alloc, &agg));
-    try testing.expectEqualStrings(
-        "Analytic function string_agg does not support DISTINCT.",
-        bind.message.?,
-    );
-    // Without DISTINCT the same frame still aggregates, duplicates included.
+    try value_mod.expectValueEqual(.{ .string = "a,b" }, try f.done(alloc, &agg));
+    // Without DISTINCT the same frame aggregates duplicates too.
     opt.distinct = false;
     agg.setOption(opt);
     try value_mod.expectValueEqual(.{ .string = "a,b,a" }, try f.done(alloc, &agg));
 
-    // ARRAY_AGG(x IGNORE NULLS) OVER (): BigQuery refuses to plan it.
     var agg2 = WindowFuncAggregatedStatus{ .cache_alloc = alloc };
     try agg2.step(alloc, .{ .int = 1 });
     try agg2.step(alloc, .null);
@@ -1054,10 +1037,9 @@ test "analytic string_agg rejects DISTINCT, array_agg rejects IGNORE NULLS" {
     opt2.ignore_nulls = true;
     agg2.setOption(opt2);
     var g = WINDOW_ARRAY_AGG{};
-    try testing.expectError(error.UnsupportedOperation, g.done(alloc, &agg2));
-    try testing.expectEqualStrings(
-        "Analytic function array_agg does not support IGNORE NULLS or RESPECT NULLS.",
-        bind.message.?,
+    try value_mod.expectValueEqual(
+        try value_mod.arrayValue(alloc, &.{ .{ .int = 1 }, .{ .int = 2 } }),
+        try g.done(alloc, &agg2),
     );
     // Without IGNORE NULLS the NULL stays in the array.
     opt2.ignore_nulls = false;
