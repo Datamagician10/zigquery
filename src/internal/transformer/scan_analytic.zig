@@ -280,7 +280,8 @@ test "checkAnalyticOptionRejections" {
         var args: std.ArrayList(types_data.ExpressionData) = .empty;
         try args.append(alloc, .{});
         for (case.options) |option| {
-            try args.append(alloc, try types_data.newFunctionCallExpressionData(alloc, option, &.{}));
+            const marker = try types_data.newFunctionCallExpressionData(alloc, option, &.{});
+            try args.append(alloc, marker);
         }
         const call = try types_data.newFunctionCallExpressionData(
             alloc,
