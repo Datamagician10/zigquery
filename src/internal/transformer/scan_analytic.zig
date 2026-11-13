@@ -231,7 +231,10 @@ test "golden SQL: DISTINCT and IGNORE NULLS become trailing pseudo-args" {
             .{},
         );
         try expectContains(stmts[0], "zigquery_window_count(`x__");
-        try expectContains(stmts[0], ", zigquery_distinct()) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)");
+        try expectContains(
+            stmts[0],
+            ", zigquery_distinct()) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+        );
     }
 
     // FIRST_VALUE(x IGNORE NULLS) OVER (ORDER BY x) -> trailing
